@@ -1,0 +1,40 @@
+{
+  "name": "post-generate",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@10.8.1",
+  "scripts": {
+    "dev": "next dev -H 127.0.0.1 -p 5174",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "remotion:preview": "remotion preview remotion/index.ts",
+    "remotion:render:png": "node remotion/scripts/render-png.mjs"
+  },
+  "dependencies": {
+    "@remotion/bundler": "^4.0.0",
+    "@remotion/renderer": "^4.0.0",
+    "jszip": "^3.10.1",
+    "konva": "^9.3.20",
+    "nanoid": "^5.0.7",
+    "next": "14.2.5",
+    "react": "18.2.0",
+    "react-dom": "18.2.0",
+    "react-konva": "^18.2.10",
+    "remotion": "^4.0.0",
+    "use-image": "^1.1.1",
+    "zod": "^3.23.8",
+    "zustand": "^4.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.10",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "autoprefixer": "^10.4.19",
+    "eslint": "^8.57.0",
+    "eslint-config-next": "14.2.5",
+    "postcss": "^8.4.39",
+    "tailwindcss": "^3.4.7",
+    "typescript": "^5.5.4"
+  }
+}

@@ -1,0 +1,11 @@
+node_modules
+.next
+.pnpm-store
+data
+public/generated
+public/uploads
+.env.local
+.env.*.local
+.DS_Store
+*.log
+*.tsbuildinfo
