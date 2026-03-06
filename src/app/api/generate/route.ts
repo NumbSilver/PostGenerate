@@ -17,6 +17,12 @@ const BodySchema = z.object({
   }),
   drawCount: z.number().int().min(1).max(12).default(4),
   includeNegative: z.boolean().optional().default(true),
+  referenceImage: z
+    .object({
+      mimeType: z.string().min(1),
+      base64: z.string().min(8)
+    })
+    .optional(),
   requestId: z.string().optional(),
   thinking: z
     .object({
@@ -57,6 +63,7 @@ export async function POST(req: Request) {
         aspectRatio,
         seedTag: body.requestId ? `${body.requestId}_${i}` : `seed_${seed}_${i}`,
         includeNegative: body.includeNegative,
+        referenceImage: body.referenceImage,
         thinking: body.thinking
           ? { include_thoughts: body.thinking.include_thoughts, budget_tokens: body.thinking.budget_tokens }
           : undefined
@@ -70,7 +77,7 @@ export async function POST(req: Request) {
         aspectRatio,
         seed,
         logId: gen.logId,
-        ...gen.params
+        ...(gen.params ?? {})
       };
     } catch (e) {
       nanoBananaError = e instanceof Error ? e.message : String(e);

@@ -39,24 +39,30 @@ const MultimodalResponseSchema = z.object({
       finish_reason: z.string().optional(),
       message: z.object({
         role: z.string().optional(),
-        multimodal_contents: z
-          .array(
-            z.discriminatedUnion("type", [
-              z.object({ type: z.literal("text"), text: z.string() }),
-              z.object({
-                type: z.literal("inline_data"),
-                inline_data: z.object({
-                  mime_type: z.string(),
-                  data: z.string()
-                })
-              })
-            ])
-          )
-          .optional()
+        content: z.string().optional(),
+        multimodal_contents: z.array(z.any()).optional()
       })
     })
   )
 });
+
+function extractInlineImage(multimodalContents: unknown[]) {
+  for (const part of multimodalContents) {
+    const maybe = part as any;
+    const inline = maybe?.inline_data ?? maybe?.inlineData ?? maybe?.data;
+    if (inline?.data && inline?.mime_type) return { mime_type: inline.mime_type as string, data: inline.data as string };
+    if (maybe?.type === "inline_data" && maybe?.inline_data?.data && maybe?.inline_data?.mime_type) {
+      return { mime_type: maybe.inline_data.mime_type as string, data: maybe.inline_data.data as string };
+    }
+  }
+  return null;
+}
+
+function extractTextParts(multimodalContents: unknown[]) {
+  return multimodalContents
+    .map((p) => (p as any)?.type === "text" ? (p as any)?.text : null)
+    .filter((t): t is string => typeof t === "string");
+}
 
 export async function nanoBanana3pGenerateImage({
   text,
@@ -64,6 +70,7 @@ export async function nanoBanana3pGenerateImage({
   imageSize = "1K",
   seedTag,
   includeNegative,
+  referenceImage,
   thinking
 }: {
   text: string;
@@ -71,6 +78,7 @@ export async function nanoBanana3pGenerateImage({
   imageSize?: "1K" | "2K";
   seedTag: string;
   includeNegative: boolean;
+  referenceImage?: { mimeType: string; base64: string };
   thinking?: NanoBanana3pThinking;
 }) {
   const normalizedThinking = normalizeThinking(thinking);
@@ -88,43 +96,40 @@ export async function nanoBanana3pGenerateImage({
         "Avoid obvious watermarks and brand logos."
       ].join("\n");
 
-  const jsonRequirement = includeNegative
-    ? [
-        "Return a JSON text first (JSON only, no markdown fences):",
-        '{ "prompt": string, "negativePrompt": string, "params": object }',
-        "negativePrompt MUST explicitly ban: text, watermark, logo, typography."
-      ].join("\n")
-    : [
-        "Return a JSON text first (JSON only, no markdown fences):",
-        '{ "prompt": string, "negativePrompt"?: string, "params": object }',
-        "negativePrompt can be empty or omitted."
-      ].join("\n");
-
   const baseBody = {
     stream: false,
     model: model(),
-    max_tokens: 4096,
+    max_tokens: 20000,
     messages: [
       {
         role: "user",
-        content: [
+        content: ([
           {
             type: "text",
             text: [
               "你是海报生成器。",
-              "In one response, return:",
-              "1) JSON text",
-              "2) One poster background PNG image",
-              "",
-              jsonRequirement,
-              "",
+              "请生成一张海报背景 PNG 图片。",
+              "请不要输出 JSON，不要输出代码块。",
+              "文本输出（TEXT）可以为空或只输出一句话描述。",
               constraint,
               "",
               "主题含义：",
               text
             ].join("\n")
           }
-        ]
+        ] as any[]).concat(
+          referenceImage
+            ? [
+                {
+                  type: "image",
+                  image_url: {
+                    url: referenceImage.base64,
+                    mime_type: referenceImage.mimeType
+                  }
+                }
+              ]
+            : []
+        )
       }
     ],
     response_modalities: ["TEXT", "IMAGE"],
@@ -140,8 +145,32 @@ export async function nanoBanana3pGenerateImage({
     const url = new URL("/gpt/openapi/online/multimodal/crawl", base);
     url.searchParams.set("ak", ak());
 
-    const attempt = async (includeThinking: boolean) => {
-      const body = includeThinking && normalizedThinking ? { ...baseBody, thinking: normalizedThinking } : baseBody;
+    let referenceImageUsed = Boolean(referenceImage);
+    let referenceImageIgnoredReason: string | undefined;
+
+    const attempt = async (opts: { includeThinking: boolean; includeRefImage: boolean; imageOnly?: boolean }) => {
+      const { includeThinking, includeRefImage, imageOnly } = opts;
+      const messages = includeRefImage ? baseBody.messages : [{ ...baseBody.messages[0]!, content: baseBody.messages[0]!.content.slice(0, 1) }];
+      const body0 = {
+        ...baseBody,
+        messages: imageOnly
+          ? [
+              {
+                ...messages[0]!,
+                content: [
+                  {
+                    ...(messages[0]!.content[0] as any),
+                    text: `${(messages[0]!.content[0] as any).text}\n\n只返回一张 PNG 图片（IMAGE），不要返回任何文字。`
+                  },
+                  ...messages[0]!.content.slice(1)
+                ]
+              }
+            ]
+          : messages,
+        response_modalities: imageOnly ? ["IMAGE"] : baseBody.response_modalities,
+        max_tokens: imageOnly ? 1024 : baseBody.max_tokens
+      };
+      const body = includeThinking && normalizedThinking ? { ...body0, thinking: normalizedThinking } : body0;
       const resp = await fetch(url.toString(), {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-TT-LOGID": id },
@@ -151,10 +180,23 @@ export async function nanoBanana3pGenerateImage({
       return { ok: resp.ok, status: resp.status, text };
     };
 
-    const first = await attempt(true);
+    let first = await attempt({ includeThinking: true, includeRefImage: true });
     const shouldRetryWithoutThinking =
       !first.ok && (first.text.includes("thinking is not supported") || first.text.includes("thinking") && first.status === 400);
-    const final = shouldRetryWithoutThinking ? await attempt(false) : first;
+    if (shouldRetryWithoutThinking) first = await attempt({ includeThinking: false, includeRefImage: true });
+    const shouldDropRefImage =
+      !first.ok &&
+      referenceImage &&
+      (first.text.includes("Provided image is not valid") ||
+        first.text.includes("unsupport Part Type") ||
+        first.text.includes("Part Type: image") ||
+        first.text.includes("\"code\":\"-1013\""));
+    if (shouldDropRefImage) {
+      referenceImageUsed = false;
+      referenceImageIgnoredReason = "gateway does not support image parts (dropped reference image)";
+      first = await attempt({ includeThinking: false, includeRefImage: false });
+    }
+    const final = first;
 
     if (!final.ok) {
       lastErrs.push(`${base} HTTP ${final.status}: ${final.text}`);
@@ -162,45 +204,54 @@ export async function nanoBanana3pGenerateImage({
     }
 
     const json = MultimodalResponseSchema.parse(JSON.parse(final.text));
-    const mm = json.choices[0]?.message?.multimodal_contents ?? [];
-    const image = mm.find((c) => c.type === "inline_data") as
-      | { type: "inline_data"; inline_data: { mime_type: string; data: string } }
-      | undefined;
-    const textParts = mm.filter((c) => c.type === "text").map((c) => (c as any).text as string);
-    if (!image) throw new Error("NanoBanana response missing inline_data image");
+    const message = json.choices[0]?.message;
+    const mm = message?.multimodal_contents ?? [];
+    const image = extractInlineImage(mm);
+    const textParts = extractTextParts(mm);
 
-    const joinedText = textParts.join("");
-    const promptJson = safeParseJson(joinedText);
-    const PromptSchema = z.object({
-      prompt: z.string(),
-      negativePrompt: z.string().optional(),
-      params: z.record(z.unknown()).optional()
-    });
-    const validated = PromptSchema.parse(promptJson);
+    if (!image) {
+      // Some responses sporadically return TEXT-only despite requesting IMAGE; retry once with IMAGE-only.
+      const retry = await attempt({ includeThinking: false, includeRefImage: Boolean(referenceImage), imageOnly: true });
+      if (retry.ok) {
+        const json2 = MultimodalResponseSchema.parse(JSON.parse(retry.text));
+        const mm2 = json2.choices[0]?.message?.multimodal_contents ?? [];
+        const image2 = extractInlineImage(mm2);
+        const textParts2 = extractTextParts(mm2);
+        if (image2) {
+          return {
+            logId: id,
+            mimeType: image2.mime_type,
+            base64: image2.data,
+            rawText: textParts2.join(""),
+            prompt: text,
+            negativePrompt: includeNegative ? "text, letters, words, logo, watermark, typography" : undefined,
+            params: { referenceImageUsed, referenceImageIgnoredReason }
+          };
+        }
+      }
+      const msgKeys = message ? Object.keys(message as any).join(", ") : "(no message)";
+      const firstPart = mm[0] ? JSON.stringify(mm[0]).slice(0, 240) : "(empty multimodal_contents)";
+      throw new Error(
+        `NanoBanana response missing image payload. message keys: ${msgKeys} multimodal_contents length: ${mm.length} first part: ${firstPart} response snippet: ${final.text.slice(
+          0,
+          260
+        )}`
+      );
+    }
 
     return {
       logId: id,
-      mimeType: image.inline_data.mime_type,
-      base64: image.inline_data.data,
-      rawText: joinedText,
-      prompt: validated.prompt,
-      negativePrompt: includeNegative
-        ? (validated.negativePrompt ?? "text, letters, words, logo, watermark, typography")
-        : validated.negativePrompt,
-      params: validated.params ?? {}
+      mimeType: image.mime_type,
+      base64: image.data,
+      rawText: textParts.join(""),
+      // Meta is no longer forced to be returned in the multimodal response.
+      prompt: text,
+      negativePrompt: includeNegative ? "text, letters, words, logo, watermark, typography" : undefined,
+      params: { referenceImageUsed, referenceImageIgnoredReason }
     };
   }
   throw new Error(lastErrs.join("\n\n"));
 }
 
-function safeParseJson(s: string) {
-  const trimmed = s.trim();
-  try {
-    return JSON.parse(trimmed);
-  } catch {
-    const start = trimmed.indexOf("{");
-    const end = trimmed.lastIndexOf("}");
-    if (start >= 0 && end > start) return JSON.parse(trimmed.slice(start, end + 1));
-    throw new Error(`NanoBanana text is not JSON: ${trimmed.slice(0, 200)}`);
-  }
-}
+// NOTE: This gateway may return text-only or image-only; we intentionally do not
+// parse TEXT as JSON to avoid reducing the probability of an IMAGE payload.

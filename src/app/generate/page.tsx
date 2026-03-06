@@ -19,6 +19,9 @@ export default function GeneratePage() {
   const [width, setWidth] = useState(1080);
   const [height, setHeight] = useState(1920);
   const [includeNegative, setIncludeNegative] = useState(true);
+  const [referenceImage, setReferenceImage] = useState<{ mimeType: string; base64: string; name: string } | null>(
+    null
+  );
   const [sendThinking, setSendThinking] = useState<boolean>(false);
   const [thinkingBudget, setThinkingBudget] = useState<number>(8192);
   const [includeThoughts, setIncludeThoughts] = useState<boolean>(true);
@@ -27,6 +30,18 @@ export default function GeneratePage() {
   const [error, setError] = useState<string | null>(null);
 
   const canGenerate = useMemo(() => text.trim().length > 0 && !loading, [text, loading]);
+
+  async function readFileAsBase64(file: File) {
+    const buf = await file.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    let binary = "";
+    // Avoid call stack limits for large files.
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+    }
+    return btoa(binary);
+  }
 
   async function onGenerate() {
     if (!canGenerate) return;
@@ -43,6 +58,12 @@ export default function GeneratePage() {
           drawCount: 1,
           requestId: nanoid(),
           includeNegative,
+          referenceImage: referenceImage
+            ? {
+                mimeType: referenceImage.mimeType,
+                base64: referenceImage.base64
+              }
+            : undefined,
           ...(sendThinking
             ? {
                 thinking: {
@@ -95,7 +116,7 @@ export default function GeneratePage() {
   return (
     <div className="mx-auto max-w-6xl p-6">
       <div className="mb-4 flex items-center justify-between">
-        <div className="text-xl font-semibold">输入文本 → 抽卡生成无文字海报（4 张）</div>
+        <div className="text-xl font-semibold">输入文本 → 抽卡生成无文字海报（1 张）</div>
       </div>
 
       <div className="grid grid-cols-1 gap-4 md:grid-cols-5">
@@ -195,6 +216,44 @@ export default function GeneratePage() {
             </div>
           </div>
 
+          <div className="mt-4 rounded-lg border border-zinc-800 bg-zinc-900/40 p-3">
+            <div className="mb-2 text-xs font-medium text-zinc-200">参考图（可选）</div>
+            {referenceImage ? (
+              <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="truncate text-xs text-zinc-200">{referenceImage.name}</div>
+                  <div className="text-[11px] text-zinc-500">{referenceImage.mimeType}</div>
+                </div>
+                <button
+                  onClick={() => setReferenceImage(null)}
+                  className="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1 text-xs"
+                >
+                  移除
+                </button>
+              </div>
+            ) : (
+              <label className="block w-full cursor-pointer rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-center text-sm text-zinc-200">
+                上传参考图
+                <input
+                  type="file"
+                  accept="image/*"
+                  className="hidden"
+                  onChange={async (e) => {
+                    const f = e.target.files?.[0];
+                    if (!f) return;
+                    try {
+                      const base64 = await readFileAsBase64(f);
+                      setReferenceImage({ mimeType: f.type || "image/png", base64, name: f.name });
+                    } catch (err) {
+                      setError(err instanceof Error ? err.message : "读取图片失败");
+                    }
+                  }}
+                />
+              </label>
+            )}
+            <div className="mt-2 text-xs text-zinc-500">不上传也可以生成；上传后会参考图片风格/构图。</div>
+          </div>
+
           <button
             onClick={onGenerate}
             disabled={!canGenerate}
@@ -210,7 +269,7 @@ export default function GeneratePage() {
           <div className="mb-2 text-sm text-zinc-300">候选</div>
           {candidates.length === 0 ? (
             <div className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-6 text-sm text-zinc-400">
-              这里会展示 4 张候选海报。点击某张进入编辑器。
+              这里会展示候选海报。点击进入编辑器。
             </div>
           ) : (
             <div className="grid grid-cols-2 gap-4">
