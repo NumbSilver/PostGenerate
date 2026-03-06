@@ -16,6 +16,7 @@ const BodySchema = z.object({
     height: z.number().int().min(320).max(4096)
   }),
   drawCount: z.number().int().min(1).max(12).default(4),
+  includeNegative: z.boolean().optional().default(true),
   requestId: z.string().optional(),
   thinking: z
     .object({
@@ -55,6 +56,7 @@ export async function POST(req: Request) {
         text: body.text,
         aspectRatio,
         seedTag: body.requestId ? `${body.requestId}_${i}` : `seed_${seed}_${i}`,
+        includeNegative: body.includeNegative,
         thinking: body.thinking
           ? { include_thoughts: body.thinking.include_thoughts, budget_tokens: body.thinking.budget_tokens }
           : undefined
@@ -85,7 +87,7 @@ export async function POST(req: Request) {
     if (provider === "FallbackSVG") {
       const filename = `${id}.svg`;
       const abs = path.join(outDir, filename);
-      const fallback = generateFallbackPosterSvg({ width, height, seed });
+      const fallback = generateFallbackPosterSvg({ width, height, seed, includeNegative: body.includeNegative });
       await fs.writeFile(abs, fallback.svg, "utf8");
       imageUrl = `/generated/${filename}`;
     } else {

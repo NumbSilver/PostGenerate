@@ -18,6 +18,7 @@ export default function GeneratePage() {
   const [text, setText] = useState("");
   const [width, setWidth] = useState(1080);
   const [height, setHeight] = useState(1920);
+  const [includeNegative, setIncludeNegative] = useState(true);
   const [sendThinking, setSendThinking] = useState<boolean>(false);
   const [thinkingBudget, setThinkingBudget] = useState<number>(8192);
   const [includeThoughts, setIncludeThoughts] = useState<boolean>(true);
@@ -41,6 +42,7 @@ export default function GeneratePage() {
           size: { width, height },
           drawCount: 1,
           requestId: nanoid(),
+          includeNegative,
           ...(sendThinking
             ? {
                 thinking: {
@@ -171,6 +173,25 @@ export default function GeneratePage() {
             </div>
             <div className="mt-2 text-xs text-zinc-500">
               不传时默认 8192；小于 1024 会被提升到 1024；设为 0 关闭 thinking。
+            </div>
+          </div>
+
+          <div className="mt-4 rounded-lg border border-zinc-800 bg-zinc-900/40 p-3">
+            <div className="mb-2 text-xs font-medium text-zinc-200">生成约束</div>
+            <div className="flex items-center gap-2">
+              <input
+                id="include_negative"
+                type="checkbox"
+                checked={includeNegative}
+                onChange={(e) => setIncludeNegative(e.target.checked)}
+                className="h-4 w-4 accent-white"
+              />
+              <label htmlFor="include_negative" className="text-xs text-zinc-300">
+                加入 negative prompt（禁止文字/水印/Logo）
+              </label>
+            </div>
+            <div className="mt-2 text-xs text-zinc-500">
+              关闭后模型允许在海报里生成文字（适合需要 AI 自带文案的场景）。
             </div>
           </div>
 

@@ -63,16 +63,42 @@ export async function nanoBanana3pGenerateImage({
   aspectRatio,
   imageSize = "1K",
   seedTag,
+  includeNegative,
   thinking
 }: {
   text: string;
   aspectRatio: string;
   imageSize?: "1K" | "2K";
   seedTag: string;
+  includeNegative: boolean;
   thinking?: NanoBanana3pThinking;
 }) {
   const normalizedThinking = normalizeThinking(thinking);
   const id = logId(seedTag);
+
+  const constraint = includeNegative
+    ? [
+        "Image constraints: no text, no letters, no watermark, no logo.",
+        "Leave the top ~20% clean/empty for later text overlay.",
+        "Do not include UI elements or any typographic glyphs."
+      ].join("\n")
+    : [
+        "Image constraints: text is allowed.",
+        "Still leave the top ~20% relatively clean for a title area.",
+        "Avoid obvious watermarks and brand logos."
+      ].join("\n");
+
+  const jsonRequirement = includeNegative
+    ? [
+        "Return a JSON text first (JSON only, no markdown fences):",
+        '{ "prompt": string, "negativePrompt": string, "params": object }',
+        "negativePrompt MUST explicitly ban: text, watermark, logo, typography."
+      ].join("\n")
+    : [
+        "Return a JSON text first (JSON only, no markdown fences):",
+        '{ "prompt": string, "negativePrompt"?: string, "params": object }',
+        "negativePrompt can be empty or omitted."
+      ].join("\n");
 
   const baseBody = {
     stream: false,
@@ -86,13 +112,13 @@ export async function nanoBanana3pGenerateImage({
             type: "text",
             text: [
               "你是海报生成器。",
-              "请在同一次回复里同时返回：",
-              "1) 一段 JSON 文本（只包含 JSON，不要 Markdown 代码块），用于记录生成提示词；结构：",
-              '{ "prompt": string, "negativePrompt": string, "params": object }',
-              "2) 一张海报背景图片（PNG）。",
+              "In one response, return:",
+              "1) JSON text",
+              "2) One poster background PNG image",
               "",
-              "图片要求：无任何文字/字母/水印/Logo；预留顶部约 20% 的干净留白区域，方便后续叠加文字组件；禁止出现任何 UI 字样。",
-              "JSON 要求：prompt 精准描述画面风格、构图、色彩、元素与留白；negativePrompt 必须显式禁止 text/logo/watermark/typography。",
+              jsonRequirement,
+              "",
+              constraint,
               "",
               "主题含义：",
               text
@@ -158,7 +184,9 @@ export async function nanoBanana3pGenerateImage({
       base64: image.inline_data.data,
       rawText: joinedText,
       prompt: validated.prompt,
-      negativePrompt: validated.negativePrompt ?? "text, letters, words, logo, watermark, typography",
+      negativePrompt: includeNegative
+        ? (validated.negativePrompt ?? "text, letters, words, logo, watermark, typography")
+        : validated.negativePrompt,
       params: validated.params ?? {}
     };
   }

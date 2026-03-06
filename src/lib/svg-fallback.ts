@@ -16,12 +16,14 @@ export function generateFallbackPosterSvg({
   width,
   height,
   seed,
-  reservedTopRatio = 0.22
+  reservedTopRatio = 0.22,
+  includeNegative = true
 }: {
   width: number;
   height: number;
   seed: number;
   reservedTopRatio?: number;
+  includeNegative?: boolean;
 }) {
   const r = mulberry32(seed);
   const palettes = [
@@ -80,11 +82,16 @@ export function generateFallbackPosterSvg({
   </g>
 </svg>`;
 
-  const prompt = `Abstract poster background, no text, no letters, no watermark, reserved blank space on top (~${Math.round(
-    reservedTopRatio * 100
-  )}%), vibrant gradient + soft blurred blobs, minimal modern style.`;
-  const negativePrompt = "text, letters, words, logo, watermark, typography, caption, subtitle";
+  const prompt = includeNegative
+    ? `Abstract poster background, no text, no letters, no watermark, reserved blank space on top (~${Math.round(
+        reservedTopRatio * 100
+      )}%), vibrant gradient + soft blurred blobs, minimal modern style.`
+    : `Abstract poster background with reserved blank space on top (~${Math.round(
+        reservedTopRatio * 100
+      )}%), vibrant gradient + soft blurred blobs, minimal modern style.`;
+  const negativePrompt = includeNegative
+    ? "text, letters, words, logo, watermark, typography, caption, subtitle"
+    : undefined;
 
   return { svg, prompt, negativePrompt, palette: p };
 }
-
