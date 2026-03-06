@@ -71,6 +71,7 @@ export async function nanoBanana3pGenerateImage({
   seedTag,
   includeNegative,
   referenceImage,
+  referenceStyle,
   thinking
 }: {
   text: string;
@@ -79,10 +80,15 @@ export async function nanoBanana3pGenerateImage({
   seedTag: string;
   includeNegative: boolean;
   referenceImage?: { mimeType: string; base64: string };
+  referenceStyle?: { palette?: string[] };
   thinking?: NanoBanana3pThinking;
 }) {
   const normalizedThinking = normalizeThinking(thinking);
   const id = logId(seedTag);
+
+  const styleHint = referenceStyle?.palette?.length
+    ? `参考图提取的配色（仅供风格参考）：${referenceStyle.palette.join(", ")}。请尽量使用类似的主色调、对比度与氛围。`
+    : undefined;
 
   const constraint = includeNegative
     ? [
@@ -95,6 +101,8 @@ export async function nanoBanana3pGenerateImage({
         "Still leave the top ~20% relatively clean for a title area.",
         "Avoid obvious watermarks and brand logos."
       ].join("\n");
+
+  const allowImagePart = process.env.NANOBANANA_3P_ALLOW_IMAGE_PART === "1";
 
   const baseBody = {
     stream: false,
@@ -112,13 +120,14 @@ export async function nanoBanana3pGenerateImage({
               "请不要输出 JSON，不要输出代码块。",
               "文本输出（TEXT）可以为空或只输出一句话描述。",
               constraint,
+              styleHint ? `\n${styleHint}\n` : "",
               "",
               "主题含义：",
               text
             ].join("\n")
           }
         ] as any[]).concat(
-          referenceImage
+          allowImagePart && referenceImage
             ? [
                 {
                   type: "image",
@@ -145,8 +154,9 @@ export async function nanoBanana3pGenerateImage({
     const url = new URL("/gpt/openapi/online/multimodal/crawl", base);
     url.searchParams.set("ak", ak());
 
-    let referenceImageUsed = Boolean(referenceImage);
+    let referenceImageUsed = Boolean(allowImagePart && referenceImage);
     let referenceImageIgnoredReason: string | undefined;
+    const referenceStyleUsed = Boolean(referenceStyle?.palette?.length);
 
     const attempt = async (opts: { includeThinking: boolean; includeRefImage: boolean; imageOnly?: boolean }) => {
       const { includeThinking, includeRefImage, imageOnly } = opts;
@@ -180,10 +190,10 @@ export async function nanoBanana3pGenerateImage({
       return { ok: resp.ok, status: resp.status, text };
     };
 
-    let first = await attempt({ includeThinking: true, includeRefImage: true });
+    let first = await attempt({ includeThinking: true, includeRefImage: referenceImageUsed });
     const shouldRetryWithoutThinking =
       !first.ok && (first.text.includes("thinking is not supported") || first.text.includes("thinking") && first.status === 400);
-    if (shouldRetryWithoutThinking) first = await attempt({ includeThinking: false, includeRefImage: true });
+    if (shouldRetryWithoutThinking) first = await attempt({ includeThinking: false, includeRefImage: referenceImageUsed });
     const shouldDropRefImage =
       !first.ok &&
       referenceImage &&
@@ -225,7 +235,12 @@ export async function nanoBanana3pGenerateImage({
             rawText: textParts2.join(""),
             prompt: text,
             negativePrompt: includeNegative ? "text, letters, words, logo, watermark, typography" : undefined,
-            params: { referenceImageUsed, referenceImageIgnoredReason }
+            params: {
+              referenceImageUsed,
+              referenceImageIgnoredReason,
+              referenceStyleUsed,
+              referencePalette: referenceStyle?.palette
+            }
           };
         }
       }
@@ -247,7 +262,12 @@ export async function nanoBanana3pGenerateImage({
       // Meta is no longer forced to be returned in the multimodal response.
       prompt: text,
       negativePrompt: includeNegative ? "text, letters, words, logo, watermark, typography" : undefined,
-      params: { referenceImageUsed, referenceImageIgnoredReason }
+      params: {
+        referenceImageUsed,
+        referenceImageIgnoredReason,
+        referenceStyleUsed,
+        referencePalette: referenceStyle?.palette
+      }
     };
   }
   throw new Error(lastErrs.join("\n\n"));

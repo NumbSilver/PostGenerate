@@ -19,9 +19,12 @@ export default function GeneratePage() {
   const [width, setWidth] = useState(1080);
   const [height, setHeight] = useState(1920);
   const [includeNegative, setIncludeNegative] = useState(true);
-  const [referenceImage, setReferenceImage] = useState<{ mimeType: string; base64: string; name: string } | null>(
-    null
-  );
+  const [referenceImage, setReferenceImage] = useState<{
+    mimeType: string;
+    base64: string;
+    name: string;
+    palette: string[];
+  } | null>(null);
   const [sendThinking, setSendThinking] = useState<boolean>(false);
   const [thinkingBudget, setThinkingBudget] = useState<number>(8192);
   const [includeThoughts, setIncludeThoughts] = useState<boolean>(true);
@@ -41,6 +44,43 @@ export default function GeneratePage() {
       binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
     }
     return btoa(binary);
+  }
+
+  async function extractPalette(file: File): Promise<string[]> {
+    const bitmap = await createImageBitmap(file);
+    const targetW = 96;
+    const targetH = Math.max(1, Math.round((bitmap.height / bitmap.width) * targetW));
+    const canvas = document.createElement("canvas");
+    canvas.width = targetW;
+    canvas.height = targetH;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return [];
+    ctx.drawImage(bitmap, 0, 0, targetW, targetH);
+    const { data } = ctx.getImageData(0, 0, targetW, targetH);
+
+    const buckets = new Map<number, number>();
+    // 12-bit quantization: 4 bits each channel
+    for (let i = 0; i < data.length; i += 4) {
+      const a = data[i + 3] ?? 255;
+      if (a < 16) continue;
+      const r = (data[i] ?? 0) >> 4;
+      const g = (data[i + 1] ?? 0) >> 4;
+      const b = (data[i + 2] ?? 0) >> 4;
+      const key = (r << 8) | (g << 4) | b;
+      buckets.set(key, (buckets.get(key) ?? 0) + 1);
+    }
+
+    const top = [...buckets.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 6)
+      .map(([key]) => {
+        const r = ((key >> 8) & 0xf) * 17;
+        const g = ((key >> 4) & 0xf) * 17;
+        const b = (key & 0xf) * 17;
+        return `#${[r, g, b].map((v) => v.toString(16).padStart(2, "0")).join("")}`;
+      });
+
+    return Array.from(new Set(top));
   }
 
   async function onGenerate() {
@@ -64,6 +104,7 @@ export default function GeneratePage() {
                 base64: referenceImage.base64
               }
             : undefined,
+          referenceStyle: referenceImage ? { palette: referenceImage.palette } : undefined,
           ...(sendThinking
             ? {
                 thinking: {
@@ -223,6 +264,13 @@ export default function GeneratePage() {
                 <div className="min-w-0">
                   <div className="truncate text-xs text-zinc-200">{referenceImage.name}</div>
                   <div className="text-[11px] text-zinc-500">{referenceImage.mimeType}</div>
+                  {referenceImage.palette.length ? (
+                    <div className="mt-2 flex flex-wrap gap-1">
+                      {referenceImage.palette.map((c) => (
+                        <div key={c} className="h-4 w-4 rounded border border-zinc-700" style={{ background: c }} />
+                      ))}
+                    </div>
+                  ) : null}
                 </div>
                 <button
                   onClick={() => setReferenceImage(null)}
@@ -242,8 +290,9 @@ export default function GeneratePage() {
                     const f = e.target.files?.[0];
                     if (!f) return;
                     try {
+                      const palette = await extractPalette(f);
                       const base64 = await readFileAsBase64(f);
-                      setReferenceImage({ mimeType: f.type || "image/png", base64, name: f.name });
+                      setReferenceImage({ mimeType: f.type || "image/png", base64, name: f.name, palette });
                     } catch (err) {
                       setError(err instanceof Error ? err.message : "读取图片失败");
                     }
@@ -251,7 +300,7 @@ export default function GeneratePage() {
                 />
               </label>
             )}
-            <div className="mt-2 text-xs text-zinc-500">不上传也可以生成；上传后会参考图片风格/构图。</div>
+            <div className="mt-2 text-xs text-zinc-500">不上传也可以生成；上传后会提取配色并作为风格提示（第三方网关目前不支持直传图片）。</div>
           </div>
 
           <button

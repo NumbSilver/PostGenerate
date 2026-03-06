@@ -23,6 +23,11 @@ const BodySchema = z.object({
       base64: z.string().min(8)
     })
     .optional(),
+  referenceStyle: z
+    .object({
+      palette: z.array(z.string().min(4)).min(1).max(12).optional()
+    })
+    .optional(),
   requestId: z.string().optional(),
   thinking: z
     .object({
@@ -64,6 +69,7 @@ export async function POST(req: Request) {
         seedTag: body.requestId ? `${body.requestId}_${i}` : `seed_${seed}_${i}`,
         includeNegative: body.includeNegative,
         referenceImage: body.referenceImage,
+        referenceStyle: body.referenceStyle,
         thinking: body.thinking
           ? { include_thoughts: body.thinking.include_thoughts, budget_tokens: body.thinking.budget_tokens }
           : undefined
