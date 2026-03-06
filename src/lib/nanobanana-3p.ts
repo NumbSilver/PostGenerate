@@ -46,6 +46,13 @@ const MultimodalResponseSchema = z.object({
   )
 });
 
+function toDataUri(input: { mimeType: string; base64: string }) {
+  const b64 = input.base64.trim();
+  if (b64.startsWith("data:")) return b64;
+  if (b64.startsWith("http://") || b64.startsWith("https://")) return b64;
+  return `data:${input.mimeType};base64,${b64}`;
+}
+
 function extractInlineImage(multimodalContents: unknown[]) {
   for (const part of multimodalContents) {
     const maybe = part as any;
@@ -102,7 +109,17 @@ export async function nanoBanana3pGenerateImage({
         "Avoid obvious watermarks and brand logos."
       ].join("\n");
 
-  const allowImagePart = process.env.NANOBANANA_3P_ALLOW_IMAGE_PART === "1";
+  // Default to trying reference image if present. Some gateways may reject it; we fall back automatically.
+  const allowImagePart = process.env.NANOBANANA_3P_ALLOW_IMAGE_PART !== "0";
+  const referenceDataUri = referenceImage ? toDataUri(referenceImage) : undefined;
+  const referenceVariants = referenceDataUri
+    ? [
+        // Variants observed in different gateway implementations.
+        { label: "image_url(object,url)", part: { type: "image_url", image_url: { url: referenceDataUri } } },
+        { label: "image(string,image_url)", part: { type: "image", image_url: referenceDataUri } },
+        { label: "mage(string,image_url)", part: { type: "mage", image_url: referenceDataUri } }
+      ]
+    : [];
 
   const baseBody = {
     stream: false,
@@ -111,7 +128,7 @@ export async function nanoBanana3pGenerateImage({
     messages: [
       {
         role: "user",
-        content: ([
+        content: [
           {
             type: "text",
             text: [
@@ -126,19 +143,7 @@ export async function nanoBanana3pGenerateImage({
               text
             ].join("\n")
           }
-        ] as any[]).concat(
-          allowImagePart && referenceImage
-            ? [
-                {
-                  type: "image",
-                  image_url: {
-                    url: referenceImage.base64,
-                    mime_type: referenceImage.mimeType
-                  }
-                }
-              ]
-            : []
-        )
+        ] as any[]
       }
     ],
     response_modalities: ["TEXT", "IMAGE"],
@@ -156,11 +161,14 @@ export async function nanoBanana3pGenerateImage({
 
     let referenceImageUsed = Boolean(allowImagePart && referenceImage);
     let referenceImageIgnoredReason: string | undefined;
+    let referenceImageVariant: string | undefined;
     const referenceStyleUsed = Boolean(referenceStyle?.palette?.length);
 
-    const attempt = async (opts: { includeThinking: boolean; includeRefImage: boolean; imageOnly?: boolean }) => {
-      const { includeThinking, includeRefImage, imageOnly } = opts;
-      const messages = includeRefImage ? baseBody.messages : [{ ...baseBody.messages[0]!, content: baseBody.messages[0]!.content.slice(0, 1) }];
+    const attempt = async (opts: { includeThinking: boolean; includeRefImage: boolean; imageOnly?: boolean; variant?: unknown }) => {
+      const { includeThinking, includeRefImage, imageOnly, variant } = opts;
+      const baseContent = baseBody.messages[0]!.content.slice(0, 1);
+      const content = includeRefImage && variant ? (baseContent as any[]).concat([variant as any]) : baseContent;
+      const messages = [{ ...baseBody.messages[0]!, content }];
       const body0 = {
         ...baseBody,
         messages: imageOnly
@@ -190,10 +198,29 @@ export async function nanoBanana3pGenerateImage({
       return { ok: resp.ok, status: resp.status, text };
     };
 
-    let first = await attempt({ includeThinking: true, includeRefImage: referenceImageUsed });
+    const tryWithVariant = async (includeThinking: boolean) => {
+      if (!referenceImageUsed || referenceVariants.length === 0) {
+        referenceImageVariant = undefined;
+        return attempt({ includeThinking, includeRefImage: false });
+      }
+      for (const v of referenceVariants) {
+        referenceImageVariant = v.label;
+        const res = await attempt({ includeThinking, includeRefImage: true, variant: v.part });
+        // If the gateway rejects the variant, try next one.
+        if (!res.ok && (res.text.includes("unsupport Part Type") || res.text.includes("\"code\":\"-1013\""))) continue;
+        return res;
+      }
+      // All variants rejected.
+      referenceImageUsed = false;
+      referenceImageVariant = undefined;
+      referenceImageIgnoredReason = "gateway rejected all image part variants (dropped reference image)";
+      return attempt({ includeThinking, includeRefImage: false });
+    };
+
+    let first = await tryWithVariant(true);
     const shouldRetryWithoutThinking =
       !first.ok && (first.text.includes("thinking is not supported") || first.text.includes("thinking") && first.status === 400);
-    if (shouldRetryWithoutThinking) first = await attempt({ includeThinking: false, includeRefImage: referenceImageUsed });
+    if (shouldRetryWithoutThinking) first = await tryWithVariant(false);
     const shouldDropRefImage =
       !first.ok &&
       referenceImage &&
@@ -203,6 +230,7 @@ export async function nanoBanana3pGenerateImage({
         first.text.includes("\"code\":\"-1013\""));
     if (shouldDropRefImage) {
       referenceImageUsed = false;
+      referenceImageVariant = undefined;
       referenceImageIgnoredReason = "gateway does not support image parts (dropped reference image)";
       first = await attempt({ includeThinking: false, includeRefImage: false });
     }
@@ -238,6 +266,7 @@ export async function nanoBanana3pGenerateImage({
             params: {
               referenceImageUsed,
               referenceImageIgnoredReason,
+              referenceImageVariant,
               referenceStyleUsed,
               referencePalette: referenceStyle?.palette
             }
@@ -265,6 +294,7 @@ export async function nanoBanana3pGenerateImage({
       params: {
         referenceImageUsed,
         referenceImageIgnoredReason,
+        referenceImageVariant,
         referenceStyleUsed,
         referencePalette: referenceStyle?.palette
       }

@@ -25,6 +25,7 @@ export default function GeneratePage() {
     name: string;
     palette: string[];
   } | null>(null);
+  const [referenceImageUrl, setReferenceImageUrl] = useState<string>("");
   const [sendThinking, setSendThinking] = useState<boolean>(false);
   const [thinkingBudget, setThinkingBudget] = useState<number>(8192);
   const [includeThoughts, setIncludeThoughts] = useState<boolean>(true);
@@ -259,6 +260,33 @@ export default function GeneratePage() {
 
           <div className="mt-4 rounded-lg border border-zinc-800 bg-zinc-900/40 p-3">
             <div className="mb-2 text-xs font-medium text-zinc-200">参考图（可选）</div>
+            <div className="mb-3">
+              <label className="mb-1 block text-[11px] text-zinc-500">参考图 URL（可选，需外网可访问）</label>
+              <div className="flex gap-2">
+                <input
+                  value={referenceImageUrl}
+                  onChange={(e) => setReferenceImageUrl(e.target.value)}
+                  placeholder="https://example.com/image.png"
+                  className="w-full rounded-lg border border-zinc-700 bg-zinc-900 p-2 text-sm outline-none focus:border-zinc-500"
+                />
+                <button
+                  type="button"
+                  onClick={() => {
+                    const url = referenceImageUrl.trim();
+                    if (!url) return;
+                    setReferenceImage({
+                      mimeType: "image/*",
+                      base64: url,
+                      name: url,
+                      palette: []
+                    });
+                  }}
+                  className="shrink-0 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-200"
+                >
+                  使用
+                </button>
+              </div>
+            </div>
             {referenceImage ? (
               <div className="flex items-center justify-between gap-3">
                 <div className="min-w-0">
@@ -273,7 +301,10 @@ export default function GeneratePage() {
                   ) : null}
                 </div>
                 <button
-                  onClick={() => setReferenceImage(null)}
+                  onClick={() => {
+                    setReferenceImage(null);
+                    setReferenceImageUrl("");
+                  }}
                   className="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1 text-xs"
                 >
                   移除
@@ -291,8 +322,11 @@ export default function GeneratePage() {
                     if (!f) return;
                     try {
                       const palette = await extractPalette(f);
-                      const base64 = await readFileAsBase64(f);
-                      setReferenceImage({ mimeType: f.type || "image/png", base64, name: f.name, palette });
+                      const raw = await readFileAsBase64(f);
+                      const mimeType = f.type || "image/png";
+                      const base64 = `data:${mimeType};base64,${raw}`;
+                      setReferenceImage({ mimeType, base64, name: f.name, palette });
+                      setReferenceImageUrl("");
                     } catch (err) {
                       setError(err instanceof Error ? err.message : "读取图片失败");
                     }
@@ -300,7 +334,9 @@ export default function GeneratePage() {
                 />
               </label>
             )}
-            <div className="mt-2 text-xs text-zinc-500">不上传也可以生成；上传后会提取配色并作为风格提示（第三方网关目前不支持直传图片）。</div>
+            <div className="mt-2 text-xs text-zinc-500">
+              不上传也可以生成；上传后会尝试以 data URI 直传参考图，若网关不支持则自动降级为“配色风格提示”。
+            </div>
           </div>
 
           <button
