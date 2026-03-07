@@ -59,15 +59,16 @@ function renderHtml({
   const { width, height } = project.canvas;
   const layers = project.layers
     .slice()
+    .filter((layer) => layer.type !== "image" || layer.visible !== false)
     .sort((a, b) => a.z - b.z)
     .map((layer) => {
       const baseStyle = `position:absolute;left:${layer.x}px;top:${layer.y}px;width:${layer.w}px;height:${layer.h}px;transform:rotate(${layer.rotation}deg);transform-origin:top left;`;
       if (layer.type === "text") {
-        const style = `${baseStyle}color:${layer.color};font-family:${escapeHtml(layer.fontFamily)};font-size:${layer.fontSize}px;font-weight:${layer.fontWeight};white-space:pre-wrap;line-height:1.2;text-align:${layer.align};`;
+        const style = `${baseStyle}color:${layer.color};font-family:${escapeHtml(layer.fontFamily)};font-size:${layer.fontSize}px;font-weight:${layer.fontWeight};white-space:pre-wrap;line-height:${layer.lineHeight ?? 1.2};text-align:${layer.align};`;
         return `<div style="${style}">${escapeHtml(layer.text)}</div>`;
       }
       const src = rewriteSrc(layer.src);
-      return `<img alt="" src="${escapeHtml(src)}" style="${baseStyle}object-fit:contain;" />`;
+      return `<img alt="" src="${escapeHtml(src)}" style="${baseStyle}object-fit:contain;opacity:${layer.opacity ?? 1};" />`;
     })
     .join("\n");
 
@@ -94,4 +95,3 @@ function renderHtml({
   </body>
 </html>`;
 }
-

@@ -2,10 +2,13 @@
 
 import React, { useMemo, useState } from "react";
 import { nanoid } from "nanoid";
+import type { PosterImageLayer, PosterTextLayer } from "@/lib/types";
 
 type Candidate = {
   id: string;
   imageUrl: string;
+  editorBackgroundUrl?: string;
+  layers: Array<PosterTextLayer | PosterImageLayer>;
   meta: {
     prompt: string;
     negativePrompt?: string;
@@ -14,11 +17,23 @@ type Candidate = {
   };
 };
 
+function parseOtherLines(input: string) {
+  return input
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(0, 8);
+}
+
 export default function GeneratePage() {
-  const [text, setText] = useState("");
+  const [imageModel, setImageModel] = useState<"gemini-3-pro-image-preview" | "qwen-image" | "gpt-image-1.5">("gpt-image-1.5");
+  const [stylePrompt, setStylePrompt] = useState("");
+  const [title, setTitle] = useState("");
+  const [subtitle, setSubtitle] = useState("");
+  const [otherText, setOtherText] = useState("");
   const [width, setWidth] = useState(1080);
   const [height, setHeight] = useState(1920);
-  const [includeNegative, setIncludeNegative] = useState(true);
+  const [includeNegative, setIncludeNegative] = useState(false);
   const [referenceImage, setReferenceImage] = useState<{
     mimeType: string;
     base64: string;
@@ -33,13 +48,12 @@ export default function GeneratePage() {
   const [candidates, setCandidates] = useState<Candidate[]>([]);
   const [error, setError] = useState<string | null>(null);
 
-  const canGenerate = useMemo(() => text.trim().length > 0 && !loading, [text, loading]);
+  const canGenerate = useMemo(() => stylePrompt.trim().length > 0 && title.trim().length > 0 && !loading, [stylePrompt, title, loading]);
 
   async function readFileAsBase64(file: File) {
     const buf = await file.arrayBuffer();
     const bytes = new Uint8Array(buf);
     let binary = "";
-    // Avoid call stack limits for large files.
     const chunk = 0x8000;
     for (let i = 0; i < bytes.length; i += chunk) {
       binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
@@ -60,7 +74,6 @@ export default function GeneratePage() {
     const { data } = ctx.getImageData(0, 0, targetW, targetH);
 
     const buckets = new Map<number, number>();
-    // 12-bit quantization: 4 bits each channel
     for (let i = 0; i < data.length; i += 4) {
       const a = data[i + 3] ?? 255;
       if (a < 16) continue;
@@ -78,7 +91,7 @@ export default function GeneratePage() {
         const r = ((key >> 8) & 0xf) * 17;
         const g = ((key >> 4) & 0xf) * 17;
         const b = (key & 0xf) * 17;
-        return `#${[r, g, b].map((v) => v.toString(16).padStart(2, "0")).join("")}`;
+        return `#${[r, g, b].map((value) => value.toString(16).padStart(2, "0")).join("")}`;
       });
 
     return Array.from(new Set(top));
@@ -94,7 +107,13 @@ export default function GeneratePage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          text,
+          imageModel,
+          stylePrompt,
+          textContent: {
+            title,
+            subtitle: subtitle.trim() || undefined,
+            others: parseOtherLines(otherText)
+          },
           size: { width, height },
           drawCount: 1,
           requestId: nanoid(),
@@ -133,13 +152,23 @@ export default function GeneratePage() {
     setLoading(true);
     setError(null);
     try {
+      const inputText = [
+        `风格：${stylePrompt}`,
+        `主标题：${title}`,
+        subtitle.trim() ? `副标题：${subtitle.trim()}` : "",
+        ...parseOtherLines(otherText).map((line, index) => `其他文字${index + 1}：${line}`)
+      ]
+        .filter(Boolean)
+        .join("\n");
+
       const resp = await fetch("/api/projects", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          inputText: text,
-          canvas: { width, height, backgroundUrl: candidate.imageUrl },
-          meta: candidate.meta
+          inputText,
+          canvas: { width, height, backgroundUrl: candidate.editorBackgroundUrl ?? candidate.imageUrl },
+          meta: candidate.meta,
+          layers: candidate.layers
         })
       });
       if (!resp.ok) {
@@ -158,19 +187,66 @@ export default function GeneratePage() {
   return (
     <div className="mx-auto max-w-6xl p-6">
       <div className="mb-4 flex items-center justify-between">
-        <div className="text-xl font-semibold">输入文本 → 抽卡生成无文字海报（1 张）</div>
+        <div className="text-xl font-semibold">先生成海报A（含字）→ 再编辑生成海报B（去字）→ 进入画布叠层调字</div>
       </div>
 
       <div className="grid grid-cols-1 gap-4 md:grid-cols-5">
         <div className="md:col-span-2">
-          <label className="mb-2 block text-sm text-zinc-300">文本</label>
+          <label className="mb-2 block text-sm text-zinc-300">图片风格描述</label>
           <textarea
-            value={text}
-            onChange={(e) => setText(e.target.value)}
-            rows={10}
+            value={stylePrompt}
+            onChange={(e) => setStylePrompt(e.target.value)}
+            rows={5}
             className="w-full rounded-lg border border-zinc-700 bg-zinc-900 p-3 text-sm outline-none focus:border-zinc-500"
-            placeholder="输入一段话，用来生成海报含义（海报不出字，留白给后续文字组件）"
+            placeholder="例如：赛博朋克夜景，霓虹灯反射，电影海报质感，强对比，留白区域用于标题。"
           />
+
+          <div className="mt-3">
+            <label className="mb-1 block text-xs text-zinc-400">生图模型</label>
+            <select
+              value={imageModel}
+              onChange={(e) => setImageModel(e.target.value as "gemini-3-pro-image-preview" | "qwen-image" | "gpt-image-1.5")}
+              className="w-full rounded-lg border border-zinc-700 bg-zinc-900 p-2 text-sm outline-none focus:border-zinc-500"
+            >
+              <option value="gpt-image-1.5">gpt-image-1.5</option>
+              <option value="qwen-image">qwen-image</option>
+              <option value="gemini-3-pro-image-preview">gemini-3-pro-image-preview</option>
+            </select>
+          </div>
+
+          <div className="mt-4 rounded-lg border border-zinc-800 bg-zinc-900/40 p-3">
+            <div className="mb-2 text-xs font-medium text-zinc-200">要展示的文字内容</div>
+            <div className="space-y-3">
+              <div>
+                <label className="mb-1 block text-xs text-zinc-400">主标题（必填）</label>
+                <input
+                  value={title}
+                  onChange={(e) => setTitle(e.target.value)}
+                  className="w-full rounded-lg border border-zinc-700 bg-zinc-900 p-2 text-sm outline-none focus:border-zinc-500"
+                  placeholder="输入主标题"
+                />
+              </div>
+              <div>
+                <label className="mb-1 block text-xs text-zinc-400">副标题（可选）</label>
+                <input
+                  value={subtitle}
+                  onChange={(e) => setSubtitle(e.target.value)}
+                  className="w-full rounded-lg border border-zinc-700 bg-zinc-900 p-2 text-sm outline-none focus:border-zinc-500"
+                  placeholder="输入副标题"
+                />
+              </div>
+              <div>
+                <label className="mb-1 block text-xs text-zinc-400">其他文字（可选，每行一条）</label>
+                <textarea
+                  value={otherText}
+                  onChange={(e) => setOtherText(e.target.value)}
+                  rows={4}
+                  className="w-full rounded-lg border border-zinc-700 bg-zinc-900 p-2 text-sm outline-none focus:border-zinc-500"
+                  placeholder={"例如：\n3月20日 19:30\n上海东方艺术中心"}
+                />
+              </div>
+            </div>
+          </div>
 
           <div className="mt-4 grid grid-cols-2 gap-3">
             <div>
@@ -250,12 +326,10 @@ export default function GeneratePage() {
                 className="h-4 w-4 accent-white"
               />
               <label htmlFor="include_negative" className="text-xs text-zinc-300">
-                加入 negative prompt（禁止文字/水印/Logo）
+                加入 negative prompt（背景图禁止文字/水印/Logo）
               </label>
             </div>
-            <div className="mt-2 text-xs text-zinc-500">
-              关闭后模型允许在海报里生成文字（适合需要 AI 自带文案的场景）。
-            </div>
+            <div className="mt-2 text-xs text-zinc-500">默认关闭；如需更强去字约束可手动开启。</div>
           </div>
 
           <div className="mt-4 rounded-lg border border-zinc-800 bg-zinc-900/40 p-3">
@@ -294,8 +368,8 @@ export default function GeneratePage() {
                   <div className="text-[11px] text-zinc-500">{referenceImage.mimeType}</div>
                   {referenceImage.palette.length ? (
                     <div className="mt-2 flex flex-wrap gap-1">
-                      {referenceImage.palette.map((c) => (
-                        <div key={c} className="h-4 w-4 rounded border border-zinc-700" style={{ background: c }} />
+                      {referenceImage.palette.map((color) => (
+                        <div key={color} className="h-4 w-4 rounded border border-zinc-700" style={{ background: color }} />
                       ))}
                     </div>
                   ) : null}
@@ -318,14 +392,14 @@ export default function GeneratePage() {
                   accept="image/*"
                   className="hidden"
                   onChange={async (e) => {
-                    const f = e.target.files?.[0];
-                    if (!f) return;
+                    const file = e.target.files?.[0];
+                    if (!file) return;
                     try {
-                      const palette = await extractPalette(f);
-                      const raw = await readFileAsBase64(f);
-                      const mimeType = f.type || "image/png";
+                      const palette = await extractPalette(file);
+                      const raw = await readFileAsBase64(file);
+                      const mimeType = file.type || "image/png";
                       const base64 = `data:${mimeType};base64,${raw}`;
-                      setReferenceImage({ mimeType, base64, name: f.name, palette });
+                      setReferenceImage({ mimeType, base64, name: file.name, palette });
                       setReferenceImageUrl("");
                     } catch (err) {
                       setError(err instanceof Error ? err.message : "读取图片失败");
@@ -335,7 +409,7 @@ export default function GeneratePage() {
               </label>
             )}
             <div className="mt-2 text-xs text-zinc-500">
-              不上传也可以生成；上传后会尝试以 data URI 直传参考图，若网关不支持则自动降级为“配色风格提示”。
+              上传后会尝试以 data URI 直传参考图，若网关不支持则自动降级为配色风格提示。
             </div>
           </div>
 
@@ -344,7 +418,7 @@ export default function GeneratePage() {
             disabled={!canGenerate}
             className="mt-4 w-full rounded-lg bg-white px-4 py-2 text-sm font-medium text-zinc-950 disabled:opacity-50"
           >
-            {loading ? "生成中..." : "抽卡生成（1张）"}
+            {loading ? "生成中..." : "生成候选（自动含文字图层）"}
           </button>
 
           {error ? <div className="mt-3 text-sm text-red-400">{error}</div> : null}
@@ -354,29 +428,56 @@ export default function GeneratePage() {
           <div className="mb-2 text-sm text-zinc-300">候选</div>
           {candidates.length === 0 ? (
             <div className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-6 text-sm text-zinc-400">
-              这里会展示候选海报。点击进入编辑器。
+              这里会展示候选海报。点击任意候选进入编辑器，可直接微调自动排版后的文字图层。
             </div>
           ) : (
             <div className="grid grid-cols-2 gap-4">
-              {candidates.map((c) => (
+              {candidates.map((candidate) => (
+                (() => {
+                  const posterAUrl =
+                    (typeof candidate.meta.params.posterAUrl === "string" ? candidate.meta.params.posterAUrl : undefined) ??
+                    candidate.editorBackgroundUrl ??
+                    candidate.imageUrl;
+                  const posterBUrl =
+                    (typeof candidate.meta.params.posterBUrl === "string" ? candidate.meta.params.posterBUrl : undefined) ??
+                    candidate.imageUrl;
+                  return (
                 <button
-                  key={c.id}
-                  onClick={() => onChoose(c)}
+                  key={candidate.id}
+                  onClick={() => onChoose(candidate)}
                   className="group overflow-hidden rounded-lg border border-zinc-800 bg-zinc-900 text-left"
                 >
-                  <div className="relative aspect-[9/16] w-full bg-zinc-950">
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img
-                      alt="candidate"
-                      src={c.imageUrl}
-                      className="h-full w-full object-cover transition-transform group-hover:scale-[1.01]"
-                    />
+                  <div className="grid grid-cols-2 gap-2 bg-zinc-950 p-2">
+                    <div>
+                      <div className="mb-1 text-[11px] text-zinc-500">去字前 A</div>
+                      <div className="relative" style={{ aspectRatio: `${width} / ${height}` }}>
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img
+                          alt="candidate-a"
+                          src={posterAUrl}
+                          className="h-full w-full rounded object-cover transition-transform group-hover:scale-[1.01]"
+                        />
+                      </div>
+                    </div>
+                    <div>
+                      <div className="mb-1 text-[11px] text-zinc-500">去字后 B</div>
+                      <div className="relative" style={{ aspectRatio: `${width} / ${height}` }}>
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img
+                          alt="candidate-b"
+                          src={posterBUrl}
+                          className="h-full w-full rounded object-cover transition-transform group-hover:scale-[1.01]"
+                        />
+                      </div>
+                    </div>
                   </div>
                   <div className="p-3">
-                    <div className="mb-1 text-[11px] text-zinc-500">provider: {c.meta.provider}</div>
-                    <div className="line-clamp-2 text-xs text-zinc-400">{c.meta.prompt}</div>
+                    <div className="mb-1 text-[11px] text-zinc-500">provider: {candidate.meta.provider}</div>
+                    <div className="line-clamp-2 text-xs text-zinc-400">{candidate.meta.prompt}</div>
                   </div>
                 </button>
+                  );
+                })()
               ))}
             </div>
           )}

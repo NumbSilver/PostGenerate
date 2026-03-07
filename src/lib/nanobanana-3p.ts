@@ -25,8 +25,16 @@ function ak() {
   return value;
 }
 
-function model() {
-  return process.env.NANOBANANA_3P_MODEL ?? "gemini-3-pro-image-preview";
+function model(modelOverride?: string) {
+  return modelOverride ?? process.env.NANOBANANA_3P_MODEL ?? "gemini-3-pro-image-preview";
+}
+
+function isQwenImageModel(name: string) {
+  return name.trim().toLowerCase() === "qwen-image";
+}
+
+function isOpenAIImagesModel(name: string) {
+  return name.trim().toLowerCase() === "gpt-image-1.5";
 }
 
 function logId(input?: string) {
@@ -53,6 +61,95 @@ function toDataUri(input: { mimeType: string; base64: string }) {
   return `data:${input.mimeType};base64,${b64}`;
 }
 
+function fromDataUri(uri: string) {
+  const match = uri.match(/^data:([^;]+);base64,(.+)$/i);
+  if (!match) return null;
+  return {
+    mime_type: match[1] || "image/png",
+    data: match[2] || ""
+  };
+}
+
+function extFromMimeType(mimeType: string) {
+  const lower = mimeType.toLowerCase();
+  if (lower.includes("png")) return "png";
+  if (lower.includes("jpeg") || lower.includes("jpg")) return "jpg";
+  if (lower.includes("webp")) return "webp";
+  return "bin";
+}
+
+function clamp(value: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function parseAspectRatio(aspectRatio: string) {
+  const [a, b] = aspectRatio.split(":").map((n) => Number(n));
+  if (!Number.isFinite(a) || !Number.isFinite(b) || a <= 0 || b <= 0) return 1;
+  return a / b;
+}
+
+function roundTo64(value: number) {
+  return Math.max(256, Math.round(value / 64) * 64);
+}
+
+function qwenSize({
+  width,
+  height,
+  aspectRatio,
+  imageSize
+}: {
+  width?: number;
+  height?: number;
+  aspectRatio: string;
+  imageSize: "1K" | "2K";
+}) {
+  const maxSide = imageSize === "2K" ? 2048 : 1024;
+  let targetW = width && width > 0 ? width : 0;
+  let targetH = height && height > 0 ? height : 0;
+
+  if (!targetW || !targetH) {
+    const ratio = parseAspectRatio(aspectRatio);
+    if (ratio >= 1) {
+      targetW = maxSide;
+      targetH = Math.round(maxSide / ratio);
+    } else {
+      targetH = maxSide;
+      targetW = Math.round(maxSide * ratio);
+    }
+  }
+
+  const currentMax = Math.max(targetW, targetH);
+  if (currentMax > maxSide) {
+    const scale = maxSide / currentMax;
+    targetW = Math.round(targetW * scale);
+    targetH = Math.round(targetH * scale);
+  }
+
+  targetW = roundTo64(clamp(targetW, 256, maxSide));
+  targetH = roundTo64(clamp(targetH, 256, maxSide));
+  return `${targetW}*${targetH}`;
+}
+
+function openAIImageSize({
+  width,
+  height,
+  aspectRatio,
+  imageSize
+}: {
+  width?: number;
+  height?: number;
+  aspectRatio: string;
+  imageSize: "1K" | "2K";
+}) {
+  const ratio = (() => {
+    if (width && height && width > 0 && height > 0) return width / height;
+    return parseAspectRatio(aspectRatio);
+  })();
+  if (ratio > 1.08) return imageSize === "2K" ? "1536x1024" : "1536x1024";
+  if (ratio < 0.92) return imageSize === "2K" ? "1024x1536" : "1024x1536";
+  return "1024x1024";
+}
+
 function extractInlineImage(multimodalContents: unknown[]) {
   for (const part of multimodalContents) {
     const maybe = part as any;
@@ -67,8 +164,98 @@ function extractInlineImage(multimodalContents: unknown[]) {
 
 function extractTextParts(multimodalContents: unknown[]) {
   return multimodalContents
-    .map((p) => (p as any)?.type === "text" ? (p as any)?.text : null)
+    .map((part) => ((part as any)?.type === "text" ? (part as any)?.text : null))
     .filter((t): t is string => typeof t === "string");
+}
+
+async function fetchUrlAsBase64(url: string) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`Image URL fetch failed ${resp.status}: ${url}`);
+  const contentType = resp.headers.get("content-type")?.split(";")[0]?.trim() || "image/png";
+  const buf = Buffer.from(await resp.arrayBuffer());
+  return { mime_type: contentType, data: buf.toString("base64") };
+}
+
+async function resolveUploadAsset(input: { mimeType: string; base64: string }) {
+  const raw = input.base64.trim();
+  if (raw.startsWith("http://") || raw.startsWith("https://")) {
+    const resp = await fetch(raw);
+    if (!resp.ok) throw new Error(`Reference asset fetch failed ${resp.status}: ${raw}`);
+    const mimeType = resp.headers.get("content-type")?.split(";")[0]?.trim() || "image/png";
+    return { mimeType, bytes: Buffer.from(await resp.arrayBuffer()) };
+  }
+  if (raw.startsWith("data:")) {
+    const parsed = fromDataUri(raw);
+    if (!parsed) throw new Error("Invalid data URI for reference asset");
+    return { mimeType: parsed.mime_type, bytes: Buffer.from(parsed.data, "base64") };
+  }
+  return { mimeType: input.mimeType || "image/png", bytes: Buffer.from(raw, "base64") };
+}
+
+async function extractImageFromAnyResponse(json: any) {
+  const mm = json?.choices?.[0]?.message?.multimodal_contents;
+  if (Array.isArray(mm)) {
+    const image = extractInlineImage(mm);
+    if (image) return image;
+  }
+
+  const directB64 = [
+    json?.b64_json,
+    json?.base64,
+    json?.image_base64,
+    json?.result?.image_base64,
+    json?.output?.image_base64
+  ].find((v) => typeof v === "string" && v.length > 0);
+  if (typeof directB64 === "string") {
+    const data = fromDataUri(directB64);
+    if (data) return data;
+    return { mime_type: "image/png", data: directB64 };
+  }
+
+  const candidates: any[] = [
+    json?.data?.[0],
+    json?.images?.[0],
+    json?.output?.images?.[0],
+    json?.result?.images?.[0],
+    json?.results?.[0],
+    json?.output?.[0],
+    json?.choices?.[0]?.message?.content?.[0]
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    const b64 = [
+      candidate?.b64_json,
+      candidate?.base64,
+      candidate?.image_base64,
+      candidate?.imageBase64,
+      candidate?.inline_data?.data
+    ].find((v) => typeof v === "string" && v.length > 0);
+    if (typeof b64 === "string") {
+      const data = fromDataUri(b64);
+      if (data) return data;
+      const mimeType =
+        candidate?.mime_type ?? candidate?.mimeType ?? candidate?.inline_data?.mime_type ?? candidate?.inlineData?.mimeType ?? "image/png";
+      return { mime_type: mimeType, data: b64 };
+    }
+
+    const maybeUrl =
+      candidate?.url ??
+      candidate?.image_url?.url ??
+      candidate?.image_url ??
+      candidate?.imageUrl ??
+      candidate?.output_url ??
+      candidate?.uri;
+    if (typeof maybeUrl === "string" && maybeUrl.length > 0) {
+      if (maybeUrl.startsWith("data:")) {
+        const data = fromDataUri(maybeUrl);
+        if (data) return data;
+      } else if (maybeUrl.startsWith("http://") || maybeUrl.startsWith("https://")) {
+        return await fetchUrlAsBase64(maybeUrl);
+      }
+    }
+  }
+
+  return null;
 }
 
 export async function nanoBanana3pGenerateImage({
@@ -79,7 +266,11 @@ export async function nanoBanana3pGenerateImage({
   includeNegative,
   referenceImage,
   referenceStyle,
-  thinking
+  thinking,
+  width,
+  height,
+  modelOverride,
+  referenceMask
 }: {
   text: string;
   aspectRatio: string;
@@ -89,7 +280,12 @@ export async function nanoBanana3pGenerateImage({
   referenceImage?: { mimeType: string; base64: string };
   referenceStyle?: { palette?: string[] };
   thinking?: NanoBanana3pThinking;
+  width?: number;
+  height?: number;
+  modelOverride?: string;
+  referenceMask?: { mimeType: string; base64: string };
 }) {
+  const selectedModel = model(modelOverride);
   const normalizedThinking = normalizeThinking(thinking);
   const id = logId(seedTag);
 
@@ -109,12 +305,151 @@ export async function nanoBanana3pGenerateImage({
         "Avoid obvious watermarks and brand logos."
       ].join("\n");
 
-  // Default to trying reference image if present. Some gateways may reject it; we fall back automatically.
+  const promptText = [constraint, styleHint ?? "", "", text].join("\n").trim();
+
+  if (isOpenAIImagesModel(selectedModel)) {
+    const errors: string[] = [];
+    for (const base of baseUrls()) {
+      const quality = process.env.NANOBANANA_3P_OPENAI_IMAGE_QUALITY ?? "low";
+      const size = openAIImageSize({ width, height, aspectRatio, imageSize });
+      const useEdits = Boolean(referenceImage);
+      const url = new URL(
+        useEdits ? "/gpt/openapi/online/v2/crawl/openai/images/edits" : "/gpt/openapi/online/v2/crawl/openai/images/generations",
+        base
+      );
+      url.searchParams.set("ak", ak());
+      try {
+        let resp: Response;
+        if (useEdits && referenceImage) {
+          const imageAsset = await resolveUploadAsset(referenceImage);
+          const form = new FormData();
+          form.append(
+            "image[]",
+            new Blob([imageAsset.bytes], { type: imageAsset.mimeType }),
+            `reference.${extFromMimeType(imageAsset.mimeType)}`
+          );
+          if (referenceMask) {
+            const maskAsset = await resolveUploadAsset(referenceMask);
+            form.append("mask", new Blob([maskAsset.bytes], { type: maskAsset.mimeType }), `mask.${extFromMimeType(maskAsset.mimeType)}`);
+          }
+          form.append("prompt", promptText);
+          form.append("model", selectedModel);
+          form.append("quality", quality);
+          form.append("size", size);
+          form.append("n", "1");
+          resp = await fetch(url.toString(), {
+            method: "POST",
+            headers: { "X-TT-LOGID": id },
+            body: form
+          });
+        } else {
+          const body = {
+            model: selectedModel,
+            prompt: promptText,
+            n: 1,
+            size,
+            quality
+          };
+          resp = await fetch(url.toString(), {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-TT-LOGID": id },
+            body: JSON.stringify(body)
+          });
+        }
+        const raw = await resp.text();
+        if (!resp.ok) {
+          errors.push(`${base} HTTP ${resp.status}: ${raw}`);
+          continue;
+        }
+        const json = JSON.parse(raw);
+        const image = await extractImageFromAnyResponse(json);
+        if (!image) {
+          errors.push(`${base} no image payload: ${raw.slice(0, 320)}`);
+          continue;
+        }
+        return {
+          logId: id,
+          mimeType: image.mime_type,
+          base64: image.data,
+          rawText: "",
+          prompt: text,
+          negativePrompt: includeNegative ? "text, letters, words, logo, watermark, typography" : undefined,
+          params: {
+            apiMode: useEdits ? "openai-images-edits-v2" : "openai-images-v2",
+            imageModel: selectedModel,
+            size,
+            quality,
+            referenceImageUsed: useEdits,
+            referenceMaskUsed: Boolean(referenceMask),
+            referenceStyleUsed: Boolean(referenceStyle?.palette?.length),
+            referencePalette: referenceStyle?.palette
+          }
+        };
+      } catch (error) {
+        errors.push(`${base} parse error: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    throw new Error(errors.join("\n\n"));
+  }
+
+  if (isQwenImageModel(selectedModel)) {
+    const errors: string[] = [];
+    for (const base of baseUrls()) {
+      const url = new URL("/gpt/openapi/online/multimodal/crawl", base);
+      url.searchParams.set("ak", ak());
+      const body = {
+        model: selectedModel,
+        input: {
+          prompt: promptText
+        },
+        parameters: {
+          size: qwenSize({ width, height, aspectRatio, imageSize }),
+          n: 1
+        }
+      };
+      const resp = await fetch(url.toString(), {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-TT-LOGID": id },
+        body: JSON.stringify(body)
+      });
+      const raw = await resp.text();
+      if (!resp.ok) {
+        errors.push(`${base} HTTP ${resp.status}: ${raw}`);
+        continue;
+      }
+      try {
+        const json = JSON.parse(raw);
+        const image = await extractImageFromAnyResponse(json);
+        if (!image) {
+          errors.push(`${base} no image payload: ${raw.slice(0, 320)}`);
+          continue;
+        }
+        return {
+          logId: id,
+          mimeType: image.mime_type,
+          base64: image.data,
+          rawText: "",
+          prompt: text,
+          negativePrompt: includeNegative ? "text, letters, words, logo, watermark, typography" : undefined,
+          params: {
+            apiMode: "qwen-image",
+            imageModel: selectedModel,
+            size: body.parameters.size,
+            referenceStyleUsed: Boolean(referenceStyle?.palette?.length),
+            referencePalette: referenceStyle?.palette
+          }
+        };
+      } catch (error) {
+        errors.push(`${base} parse error: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    throw new Error(errors.join("\n\n"));
+  }
+
   const allowImagePart = process.env.NANOBANANA_3P_ALLOW_IMAGE_PART !== "0";
   const referenceDataUri = referenceImage ? toDataUri(referenceImage) : undefined;
   const referenceVariants = referenceDataUri
     ? [
-        // Variants observed in different gateway implementations.
         { label: "image_url(object,url)", part: { type: "image_url", image_url: { url: referenceDataUri } } },
         { label: "image(string,image_url)", part: { type: "image", image_url: referenceDataUri } },
         { label: "mage(string,image_url)", part: { type: "mage", image_url: referenceDataUri } }
@@ -123,7 +458,7 @@ export async function nanoBanana3pGenerateImage({
 
   const baseBody = {
     stream: false,
-    model: model(),
+    model: selectedModel,
     max_tokens: 20000,
     messages: [
       {
@@ -194,8 +529,8 @@ export async function nanoBanana3pGenerateImage({
         headers: { "Content-Type": "application/json", "X-TT-LOGID": id },
         body: JSON.stringify(body)
       });
-      const text = await resp.text();
-      return { ok: resp.ok, status: resp.status, text };
+      const textRaw = await resp.text();
+      return { ok: resp.ok, status: resp.status, text: textRaw };
     };
 
     const tryWithVariant = async (includeThinking: boolean) => {
@@ -203,14 +538,12 @@ export async function nanoBanana3pGenerateImage({
         referenceImageVariant = undefined;
         return attempt({ includeThinking, includeRefImage: false });
       }
-      for (const v of referenceVariants) {
-        referenceImageVariant = v.label;
-        const res = await attempt({ includeThinking, includeRefImage: true, variant: v.part });
-        // If the gateway rejects the variant, try next one.
+      for (const variant of referenceVariants) {
+        referenceImageVariant = variant.label;
+        const res = await attempt({ includeThinking, includeRefImage: true, variant: variant.part });
         if (!res.ok && (res.text.includes("unsupport Part Type") || res.text.includes("\"code\":\"-1013\""))) continue;
         return res;
       }
-      // All variants rejected.
       referenceImageUsed = false;
       referenceImageVariant = undefined;
       referenceImageIgnoredReason = "gateway rejected all image part variants (dropped reference image)";
@@ -248,7 +581,6 @@ export async function nanoBanana3pGenerateImage({
     const textParts = extractTextParts(mm);
 
     if (!image) {
-      // Some responses sporadically return TEXT-only despite requesting IMAGE; retry once with IMAGE-only.
       const retry = await attempt({ includeThinking: false, includeRefImage: Boolean(referenceImage), imageOnly: true });
       if (retry.ok) {
         const json2 = MultimodalResponseSchema.parse(JSON.parse(retry.text));
@@ -264,6 +596,8 @@ export async function nanoBanana3pGenerateImage({
             prompt: text,
             negativePrompt: includeNegative ? "text, letters, words, logo, watermark, typography" : undefined,
             params: {
+              apiMode: "multimodal",
+              imageModel: selectedModel,
               referenceImageUsed,
               referenceImageIgnoredReason,
               referenceImageVariant,
@@ -288,10 +622,11 @@ export async function nanoBanana3pGenerateImage({
       mimeType: image.mime_type,
       base64: image.data,
       rawText: textParts.join(""),
-      // Meta is no longer forced to be returned in the multimodal response.
       prompt: text,
       negativePrompt: includeNegative ? "text, letters, words, logo, watermark, typography" : undefined,
       params: {
+        apiMode: "multimodal",
+        imageModel: selectedModel,
         referenceImageUsed,
         referenceImageIgnoredReason,
         referenceImageVariant,
@@ -302,6 +637,3 @@ export async function nanoBanana3pGenerateImage({
   }
   throw new Error(lastErrs.join("\n\n"));
 }
-
-// NOTE: This gateway may return text-only or image-only; we intentionally do not
-// parse TEXT as JSON to avoid reducing the probability of an IMAGE payload.

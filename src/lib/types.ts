@@ -23,14 +23,43 @@ export type PosterTextLayer = PosterLayerBase & {
   fontWeight: number;
   color: string;
   align: "left" | "center" | "right";
+  lineHeight?: number;
 };
 
 export type PosterImageLayer = PosterLayerBase & {
   type: "image";
   src: string;
+  opacity?: number;
+  visible?: boolean;
+  locked?: boolean;
+  role?: "asset" | "guide_b_overlay";
 };
 
 export type PosterLayer = PosterTextLayer | PosterImageLayer;
+
+export type PosterInputTextContent = {
+  title: string;
+  subtitle?: string;
+  others?: string[];
+};
+
+export type PosterLayoutBlock = {
+  key: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  fontSize: number;
+  fontWeight: number;
+  color: string;
+  align: "left" | "center" | "right";
+  rotation: number;
+};
+
+export type PosterLayoutPlan = {
+  blocks: PosterLayoutBlock[];
+  rationale?: string;
+};
 
 export type PosterProject = {
   id: string;
@@ -44,4 +73,3 @@ export type PosterProject = {
   meta: PosterMeta;
   layers: PosterLayer[];
 };
-

@@ -13,6 +13,7 @@ export const PosterComposition: React.FC<{ project: PosterProject }> = ({ projec
       />
 
       {layers.map((layer) => {
+        if (layer.type === "image" && layer.visible === false) return null;
         const common: React.CSSProperties = {
           position: "absolute",
           left: layer.x,
@@ -34,7 +35,7 @@ export const PosterComposition: React.FC<{ project: PosterProject }> = ({ projec
                 fontSize: layer.fontSize,
                 fontWeight: layer.fontWeight,
                 whiteSpace: "pre-wrap",
-                lineHeight: 1.2,
+                lineHeight: layer.lineHeight ?? 1.2,
                 textAlign: layer.align
               }}
             >
@@ -49,6 +50,7 @@ export const PosterComposition: React.FC<{ project: PosterProject }> = ({ projec
             src={layer.src}
             style={{
               ...common,
+              opacity: layer.opacity ?? 1,
               objectFit: "contain"
             }}
           />

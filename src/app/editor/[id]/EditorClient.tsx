@@ -4,6 +4,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { Stage, Layer, Image as KonvaImage, Text as KonvaText, Transformer } from "react-konva";
 import useImage from "use-image";
 import { nanoid } from "nanoid";
+import { fitTextInBox } from "@/lib/text-alignment";
 
 const DISPLAY_HEIGHT = 800;
 const DISPLAY_WIDTH = 450;
@@ -40,11 +41,16 @@ type TextLayer = BaseLayer & {
   fontWeight: number;
   color: string;
   align: "left" | "center" | "right";
+  lineHeight?: number;
 };
 
 type ImageLayer = BaseLayer & {
   type: "image";
   src: string;
+  opacity?: number;
+  visible?: boolean;
+  locked?: boolean;
+  role?: "asset" | "guide_b_overlay";
 };
 
 function clamp(n: number, min: number, max: number) {
@@ -116,10 +122,31 @@ export default function EditorClient({ projectId }: { projectId: string }) {
 
   function removeSelected() {
     if (!project || !selectedId) return;
+    const selected = project.layers.find((layer) => layer.id === selectedId);
+    if (selected?.type === "image" && selected.locked) return;
     const next: PosterProject = { ...project, layers: project.layers.filter((l) => l.id !== selectedId) };
     setProject(next);
     setSelectedId(null);
     void save(next);
+  }
+
+  async function applyFinalBase() {
+    if (!project) return project;
+    const posterBUrl = typeof project.meta.params.posterBUrl === "string" ? project.meta.params.posterBUrl : null;
+    if (!posterBUrl) return project;
+
+    const hasGuide = project.layers.some((layer) => layer.type === "image" && layer.role === "guide_b_overlay");
+    const isAlreadyFinal = project.canvas.background.url === posterBUrl && !hasGuide;
+    if (isAlreadyFinal) return project;
+
+    const next: PosterProject = {
+      ...project,
+      canvas: { ...project.canvas, background: { url: posterBUrl } },
+      layers: project.layers.filter((layer) => !(layer.type === "image" && layer.role === "guide_b_overlay"))
+    };
+    setProject(next);
+    await save(next);
+    return next;
   }
 
   async function addText() {
@@ -139,7 +166,7 @@ export default function EditorClient({ projectId }: { projectId: string }) {
           rotation: 0,
           z: Date.now(),
           text: "输入文字",
-          fontFamily: "system-ui",
+          fontFamily: "Noto Sans SC, PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif",
           fontSize: 64,
           fontWeight: 700,
           color: "#ffffff",
@@ -182,6 +209,37 @@ export default function EditorClient({ projectId }: { projectId: string }) {
     await save(next);
   }
 
+  function realignTextLayer(layer: TextLayer): TextLayer {
+    const fitted = fitTextInBox({
+      text: layer.text,
+      box: { x: layer.x, y: layer.y, w: layer.w, h: layer.h },
+      align: layer.align,
+      fontSize: layer.fontSize,
+      minFontSize: 12,
+      maxFontSize: Math.max(12, Math.round(layer.fontSize))
+    });
+    return {
+      ...layer,
+      x: fitted.x,
+      y: fitted.y,
+      w: fitted.w,
+      h: fitted.h,
+      text: fitted.text,
+      fontSize: fitted.fontSize,
+      lineHeight: fitted.lineHeight
+    };
+  }
+
+  async function autoAlignTextLayers() {
+    if (!project) return;
+    const next: PosterProject = {
+      ...project,
+      layers: project.layers.map((layer) => (layer.type === "text" ? realignTextLayer(layer) : layer))
+    };
+    setProject(next);
+    await save(next);
+  }
+
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
       if (e.key === "Backspace" || e.key === "Delete") {
@@ -203,6 +261,7 @@ export default function EditorClient({ projectId }: { projectId: string }) {
 
   async function exportHtml() {
     if (!project) return;
+    await applyFinalBase();
     const resp = await fetch("/api/export/html", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -220,6 +279,7 @@ export default function EditorClient({ projectId }: { projectId: string }) {
 
   async function renderPng() {
     if (!project) return;
+    await applyFinalBase();
     const resp = await fetch("/api/render/png", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -247,6 +307,18 @@ export default function EditorClient({ projectId }: { projectId: string }) {
           className="mb-2 w-full rounded-lg bg-white px-3 py-2 text-sm font-medium text-zinc-950"
         >
           添加文字
+        </button>
+        <button
+          onClick={() => void applyFinalBase()}
+          className="mb-2 w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm"
+        >
+          应用最终底图(B)
+        </button>
+        <button
+          onClick={() => void autoAlignTextLayers()}
+          className="mb-2 w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm"
+        >
+          自动重排文字
         </button>
         <label className="block w-full cursor-pointer rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-center text-sm text-zinc-200">
           上传素材
@@ -319,6 +391,7 @@ export default function EditorClient({ projectId }: { projectId: string }) {
               <Layer>
                 {project.layers
                   .slice()
+                  .filter((layer) => layer.type !== "image" || layer.visible !== false)
                   .sort((a, b) => a.z - b.z)
                   .map((layer) => {
                     if (layer.type === "text") {
@@ -338,6 +411,7 @@ export default function EditorClient({ projectId }: { projectId: string }) {
                           fontFamily={layer.fontFamily}
                           fontStyle={layer.fontWeight >= 700 ? "bold" : "normal"}
                           align={layer.align}
+                          lineHeight={layer.lineHeight ?? 1.2}
                           draggable
                           onClick={() => setSelectedId(layer.id)}
                           onTap={() => setSelectedId(layer.id)}
@@ -444,6 +518,7 @@ export default function EditorClient({ projectId }: { projectId: string }) {
 
             <button
               onClick={removeSelected}
+              disabled={selectedLayer.type === "image" && Boolean(selectedLayer.locked)}
               className="mt-4 w-full rounded-lg bg-red-500/90 px-3 py-2 text-sm font-medium text-white"
             >
               删除图层
@@ -474,12 +549,23 @@ function CanvasImageLayer({
       width={layer.w}
       height={layer.h}
       rotation={layer.rotation}
+      opacity={layer.opacity ?? 1}
       perfectDrawEnabled={false}
-      draggable
-      onClick={() => onSelect(layer.id)}
-      onTap={() => onSelect(layer.id)}
-      onDragEnd={(e) => onChange(layer.id, { x: e.target.x(), y: e.target.y() })}
+      draggable={!layer.locked}
+      onClick={() => {
+        if (layer.locked) return;
+        onSelect(layer.id);
+      }}
+      onTap={() => {
+        if (layer.locked) return;
+        onSelect(layer.id);
+      }}
+      onDragEnd={(e) => {
+        if (layer.locked) return;
+        onChange(layer.id, { x: e.target.x(), y: e.target.y() });
+      }}
       onTransformEnd={(e) => {
+        if (layer.locked) return;
         const node = e.target;
         const scaleX = node.scaleX();
         const scaleY = node.scaleY();
