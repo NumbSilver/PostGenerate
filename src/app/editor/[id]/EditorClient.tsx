@@ -392,8 +392,8 @@ export default function EditorClient({ projectId }: { projectId: string }) {
                 {project.layers
                   .slice()
                   .filter((layer) => layer.type !== "image" || layer.visible !== false)
-                  .sort((a, b) => a.z - b.z)
-                  .map((layer) => {
+                .sort((a, b) => a.z - b.z)
+                .map((layer) => {
                     if (layer.type === "text") {
                       return (
                         <KonvaText

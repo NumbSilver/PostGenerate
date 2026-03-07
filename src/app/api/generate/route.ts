@@ -7,8 +7,9 @@ import { ensureDir, publicDir } from "@/lib/storage";
 import { generateFallbackPosterSvg } from "@/lib/svg-fallback";
 import { nanoBanana3pGenerateImage } from "@/lib/nanobanana-3p";
 import { buildFallbackTextLayout, evaluateLayoutQuality, nanoBanana3pGenerateTextLayout } from "@/lib/nanobanana-layout";
+import { nanoBanana3pExtractOcrRegions, nanoBanana3pExtractTextStyleHints, type OcrRegion, type OcrTextStyleHint } from "@/lib/nanobanana-ocr";
 import { fitTextInBox } from "@/lib/text-alignment";
-import type { PosterImageLayer, PosterTextLayer } from "@/lib/types";
+import type { PosterImageLayer, PosterLayoutBlock, PosterLayoutPlan, PosterTextLayer } from "@/lib/types";
 
 export const runtime = "nodejs";
 
@@ -75,6 +76,10 @@ function randomSeed() {
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
+}
+
+function isHexColor(value: string) {
+  return /^#[0-9a-f]{6}$/i.test(value) || /^#[0-9a-f]{3}$/i.test(value);
 }
 
 function resolvedLayoutModel() {
@@ -197,34 +202,171 @@ function buildGuideOverlayLayer({
   };
 }
 
+function normalizeTextForMatch(input: string) {
+  return input.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+}
+
+function textSimilarity(expected: string, actual: string) {
+  const a = normalizeTextForMatch(expected);
+  const b = normalizeTextForMatch(actual);
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  if (a.includes(b) || b.includes(a)) return 0.9;
+
+  const bag = new Map<string, number>();
+  for (const char of a) bag.set(char, (bag.get(char) ?? 0) + 1);
+  let common = 0;
+  for (const char of b) {
+    const left = bag.get(char) ?? 0;
+    if (left <= 0) continue;
+    common += 1;
+    bag.set(char, left - 1);
+  }
+  return common / Math.max(a.length, b.length);
+}
+
+function defaultFontWeight(key: string) {
+  if (key === "title") return 800;
+  if (key === "subtitle") return 650;
+  return 500;
+}
+
+function mergeLayoutWithOcr({
+  baseLayout,
+  textItems,
+  ocrRegions,
+  width,
+  height
+}: {
+  baseLayout: PosterLayoutPlan;
+  textItems: LayoutTextItem[];
+  ocrRegions: OcrRegion[];
+  width: number;
+  height: number;
+}) {
+  if (ocrRegions.length === 0) {
+    return { layout: baseLayout, used: false, matchedKeys: [] as string[] };
+  }
+
+  const baseByKey = new Map(baseLayout.blocks.map((block) => [block.key, block]));
+  const sortedRegions = [...ocrRegions].sort((a, b) => (a.y === b.y ? a.x - b.x : a.y - b.y));
+  const usedRegionIdx = new Set<number>();
+  const matchedRegions = new Map<string, OcrRegion>();
+
+  for (const item of textItems) {
+    let bestScore = 0;
+    let bestIndex = -1;
+    for (let i = 0; i < sortedRegions.length; i++) {
+      if (usedRegionIdx.has(i)) continue;
+      const score = textSimilarity(item.text, sortedRegions[i]!.text);
+      if (score > bestScore) {
+        bestScore = score;
+        bestIndex = i;
+      }
+    }
+    if (bestIndex >= 0 && bestScore >= 0.5) {
+      usedRegionIdx.add(bestIndex);
+      matchedRegions.set(item.key, sortedRegions[bestIndex]!);
+    }
+  }
+
+  const remainingRegions = sortedRegions.filter((_, index) => !usedRegionIdx.has(index));
+  const missingItems = textItems.filter((item) => !matchedRegions.has(item.key));
+  for (let i = 0; i < missingItems.length && i < remainingRegions.length; i++) {
+    matchedRegions.set(missingItems[i]!.key, remainingRegions[i]!);
+  }
+
+  const blocks: PosterLayoutBlock[] = [];
+  const matchedKeys: string[] = [];
+  for (const item of textItems) {
+    const base = baseByKey.get(item.key);
+    const matched = matchedRegions.get(item.key);
+    if (!matched) {
+      if (base) blocks.push(base);
+      continue;
+    }
+
+    matchedKeys.push(item.key);
+    const padX = Math.max(10, Math.round(matched.w * 0.12));
+    const padY = Math.max(8, Math.round(matched.h * 0.2));
+    const x = clamp(Math.round(matched.x - padX), 0, Math.max(0, width - 20));
+    const y = clamp(Math.round(matched.y - padY), 0, Math.max(0, height - 20));
+    const w = clamp(Math.round(matched.w + padX * 2), 20, Math.max(20, width - x));
+    const h = clamp(Math.round(matched.h + padY * 2), 20, Math.max(20, height - y));
+    const fontSize = clamp(Math.round(matched.h * 0.7), 12, Math.round(height * 0.25));
+    const rotation = Math.abs(matched.angle) <= 12 ? clamp(Math.round(matched.angle), -12, 12) : 0;
+
+    blocks.push({
+      key: item.key,
+      x,
+      y,
+      w,
+      h,
+      fontSize,
+      fontWeight: base?.fontWeight ?? defaultFontWeight(item.key),
+      color: base?.color ?? "#FFFFFF",
+      align: base?.align ?? "left",
+      rotation
+    });
+  }
+
+  const existingKeys = new Set(blocks.map((block) => block.key));
+  for (const block of baseLayout.blocks) {
+    if (existingKeys.has(block.key)) continue;
+    blocks.push(block);
+  }
+
+  if (matchedKeys.length === 0) {
+    return { layout: baseLayout, used: false, matchedKeys };
+  }
+
+  return {
+    layout: {
+      blocks,
+      rationale: baseLayout.rationale ? `${baseLayout.rationale}+ocr` : "ocr_fused"
+    },
+    used: true,
+    matchedKeys
+  };
+}
+
 function buildTextLayers({
   width,
   height,
   textItems,
-  layout
+  layout,
+  styleHints
 }: {
   width: number;
   height: number;
   textItems: LayoutTextItem[];
-  layout: { blocks: Array<{ key: string; x: number; y: number; w: number; h: number; fontSize: number; fontWeight: number; color: string; align: "left" | "center" | "right"; rotation: number }> };
+  layout: PosterLayoutPlan;
+  styleHints?: Record<string, OcrTextStyleHint>;
 }): PosterTextLayer[] {
   const textMap = new Map(textItems.map((item) => [item.key, item.text]));
   const layers: PosterTextLayer[] = [];
   layout.blocks.forEach((block, index) => {
     const text = textMap.get(block.key);
     if (!text) return;
+    const style = styleHints?.[block.key];
     const x = clamp(Math.round(block.x), 0, Math.max(0, width - 20));
     const y = clamp(Math.round(block.y), 0, Math.max(0, height - 20));
     const w = clamp(Math.round(block.w), 20, Math.max(20, width - x));
     const h = clamp(Math.round(block.h), 20, Math.max(20, height - y));
+    const align = style?.align ?? block.align;
+    const baseFontSize =
+      typeof style?.fontSize === "number"
+        ? clamp(Math.round(style.fontSize), 12, Math.round(height * 0.25))
+        : clamp(Math.round(block.fontSize), 12, Math.round(height * 0.25));
     const fitted = fitTextInBox({
       text,
       box: { x, y, w, h },
-      align: block.align,
-      fontSize: clamp(Math.round(block.fontSize), 12, Math.round(height * 0.25)),
+      align,
+      fontSize: baseFontSize,
       maxFontSize: Math.round(height * 0.25),
       minFontSize: 12
     });
+
     layers.push({
       id: `layer_${nanoid()}`,
       type: "text",
@@ -237,8 +379,8 @@ function buildTextLayers({
       text: fitted.text,
       fontFamily: DEFAULT_TEXT_FONT,
       fontSize: fitted.fontSize,
-      fontWeight: clamp(Math.round(block.fontWeight), 400, 900),
-      color: block.color || "#FFFFFF",
+      fontWeight: clamp(Math.round(style?.fontWeight ?? block.fontWeight), 400, 900),
+      color: isHexColor(style?.color ?? "") ? (style?.color as string) : block.color || "#FFFFFF",
       align: fitted.align,
       lineHeight: fitted.lineHeight
     });
@@ -297,6 +439,7 @@ export async function POST(req: Request) {
     let params: Record<string, unknown>;
     let provider = "NanoBanana3P_A2B";
     let nanoBananaError: string | undefined;
+    let ocrError: string | undefined;
 
     const posterATextPrompt = buildPosterATextPrompt({ stylePrompt, textItems });
     const posterBRemoveTextPrompt = buildPosterBRemoveTextPrompt({ stylePrompt, textItems });
@@ -324,6 +467,49 @@ export async function POST(req: Request) {
         base64: genA.base64
       });
 
+      let effectiveLayout: PosterLayoutPlan = layout;
+      let ocrUsed = false;
+      let ocrMatchedKeys: string[] = [];
+      let ocrRegionCount = 0;
+      let ocrRegions: OcrRegion[] = [];
+      let ocrRawText: string | undefined;
+      let ocrLogId: string | undefined;
+      let ocrModel: string | undefined;
+      let styleHintError: string | undefined;
+      let styleHintUsed = false;
+      let styleHintLogId: string | undefined;
+      let styleHintModel: string | undefined;
+      let styleHintRawText: string | undefined;
+      let styleHintCount = 0;
+      let styleHintsByKey: Record<string, OcrTextStyleHint> | undefined;
+      if (process.env.NANOBANANA_3P_OCR_ENABLED !== "0") {
+        try {
+          const ocr = await nanoBanana3pExtractOcrRegions({
+            image: { mimeType: genA.mimeType, base64: genA.base64 },
+            canvas: { width, height },
+            seedTag: `${seedTag}_ocr`
+          });
+          ocrRegionCount = ocr.regions.length;
+          ocrRegions = ocr.regions;
+          ocrRawText = ocr.rawText;
+          ocrLogId = ocr.logId;
+          ocrModel = ocr.model;
+
+          const merged = mergeLayoutWithOcr({
+            baseLayout: layout,
+            textItems,
+            ocrRegions: ocr.regions,
+            width,
+            height
+          });
+          effectiveLayout = merged.layout;
+          ocrUsed = merged.used;
+          ocrMatchedKeys = merged.matchedKeys;
+        } catch (error) {
+          ocrError = error instanceof Error ? error.message : String(error);
+        }
+      }
+
       const genB = await nanoBanana3pGenerateImage({
         text: posterBRemoveTextPrompt,
         aspectRatio,
@@ -347,11 +533,31 @@ export async function POST(req: Request) {
         base64: genB.base64
       });
 
+      if (process.env.NANOBANANA_3P_STYLE_HINT_ENABLED !== "0" && ocrUsed) {
+        try {
+          const styleHints = await nanoBanana3pExtractTextStyleHints({
+            imageA: { mimeType: genA.mimeType, base64: genA.base64 },
+            imageB: { mimeType: genB.mimeType, base64: genB.base64 },
+            textItems: textItems.map((item) => ({ key: item.key, text: item.text })),
+            ocrRegions,
+            seedTag: `${seedTag}_style`
+          });
+          styleHintLogId = styleHints.logId;
+          styleHintModel = styleHints.model;
+          styleHintRawText = styleHints.rawText;
+          styleHintCount = styleHints.styles.length;
+          styleHintsByKey = Object.fromEntries(styleHints.styles.map((item) => [item.key, item]));
+          styleHintUsed = styleHints.styles.length > 0;
+        } catch (error) {
+          styleHintError = error instanceof Error ? error.message : String(error);
+        }
+      }
+
       prompt = posterATextPrompt;
       negativePrompt = genB.negativePrompt;
       imageUrl = posterBUrl;
       editorBackgroundUrl = posterAUrl;
-      layers = [buildGuideOverlayLayer({ width, height, src: posterBUrl }), ...buildTextLayers({ width, height, textItems, layout })];
+      layers = [buildGuideOverlayLayer({ width, height, src: posterBUrl }), ...buildTextLayers({ width, height, textItems, layout: effectiveLayout, styleHints: styleHintsByKey })];
       params = {
         model: body.imageModel ?? process.env.NANOBANANA_3P_MODEL ?? "gemini-3-pro-image-preview",
         aspectRatio,
@@ -367,7 +573,8 @@ export async function POST(req: Request) {
         imageModelA: (genA.params as Record<string, unknown> | undefined)?.imageModel,
         imageModelB: (genB.params as Record<string, unknown> | undefined)?.imageModel,
         layoutModel: resolvedLayoutModel(),
-        layoutRationale: layout.rationale,
+        layoutRationale: effectiveLayout.rationale,
+        layoutRationaleBase: layout.rationale,
         layoutQuality,
         layoutQualityScore: layoutQuality.score,
         layoutQualityPassed: layoutQuality.passed,
@@ -375,7 +582,23 @@ export async function POST(req: Request) {
         layoutAttempts: layoutQuality.attempts,
         layoutRetryUsed: layoutQuality.retryUsed,
         layoutError,
-        layoutBlocks: layout.blocks,
+        layoutBlocks: effectiveLayout.blocks,
+        layoutBlocksBase: layout.blocks,
+        ocrEnabled: process.env.NANOBANANA_3P_OCR_ENABLED !== "0",
+        ocrUsed,
+        ocrModel,
+        ocrLogId,
+        ocrRegionCount,
+        ocrMatchedKeys,
+        ocrError,
+        ocrRawText,
+        styleHintEnabled: process.env.NANOBANANA_3P_STYLE_HINT_ENABLED !== "0",
+        styleHintUsed,
+        styleHintModel,
+        styleHintLogId,
+        styleHintCount,
+        styleHintError,
+        styleHintRawText,
         generationParams: genA.params ?? {},
         editParams: genB.params ?? {}
       };
@@ -407,7 +630,12 @@ export async function POST(req: Request) {
         layoutAttempts: layoutQuality.attempts,
         layoutRetryUsed: layoutQuality.retryUsed,
         layoutError,
-        layoutBlocks: layout.blocks
+        layoutBlocks: layout.blocks,
+        ocrEnabled: process.env.NANOBANANA_3P_OCR_ENABLED !== "0",
+        ocrUsed: false,
+        ocrError,
+        styleHintEnabled: process.env.NANOBANANA_3P_STYLE_HINT_ENABLED !== "0",
+        styleHintUsed: false
       };
       provider = "FallbackSVG";
     }
