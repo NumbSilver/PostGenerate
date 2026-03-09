@@ -53,6 +53,11 @@ function wrapTextByWidth(text: string, maxWidth: number, fontSize: number) {
   return wrapLineByWidth(text, maxWidth, fontSize);
 }
 
+function longestLineWidth(lines: string[], fontSize: number) {
+  if (lines.length === 0) return 0;
+  return Math.max(...lines.map((line) => estimateTextWidth(line, fontSize)));
+}
+
 const FitInputSchema = z.object({
   text: z.string(),
   box: z.object({
@@ -67,7 +72,9 @@ const FitInputSchema = z.object({
   maxFontSize: z.number().optional(),
   lineHeight: z.number().optional(),
   paddingX: z.number().optional(),
-  paddingY: z.number().optional()
+  paddingY: z.number().optional(),
+  verticalAlign: z.union([z.literal("top"), z.literal("center"), z.literal("bottom")]).optional(),
+  autoGrow: z.boolean().optional()
 });
 
 export function fitTextInBox(input: z.infer<typeof FitInputSchema>) {
@@ -75,6 +82,8 @@ export function fitTextInBox(input: z.infer<typeof FitInputSchema>) {
   const lineHeight = parsed.lineHeight ?? TEXT_LINE_HEIGHT;
   const paddingX = parsed.paddingX ?? Math.max(8, Math.round(parsed.box.w * 0.04));
   const paddingY = parsed.paddingY ?? Math.max(6, Math.round(parsed.box.h * 0.1));
+  const verticalAlign = parsed.verticalAlign ?? "center";
+  const autoGrow = parsed.autoGrow ?? false;
 
   const safeX = Math.round(parsed.box.x);
   const safeY = Math.round(parsed.box.y);
@@ -96,6 +105,18 @@ export function fitTextInBox(input: z.infer<typeof FitInputSchema>) {
     lines = wrapTextByWidth(parsed.text, availableWidth, fontSize);
   }
 
+  if (autoGrow) {
+    while (fontSize < maxFontSize) {
+      const next = fontSize + 1;
+      const nextLines = wrapTextByWidth(parsed.text, availableWidth, next);
+      const nextHeight = nextLines.length * next * lineHeight;
+      const nextWidth = longestLineWidth(nextLines, next);
+      if (nextHeight > availableHeight || nextWidth > availableWidth * 1.02) break;
+      fontSize = next;
+      lines = nextLines;
+    }
+  }
+
   if (fontSize === minFontSize) {
     const maxLines = Math.max(1, Math.floor(availableHeight / (fontSize * lineHeight)));
     if (lines.length > maxLines) {
@@ -106,7 +127,9 @@ export function fitTextInBox(input: z.infer<typeof FitInputSchema>) {
 
   const text = lines.join("\n");
   const textHeight = Math.max(1, Math.ceil(lines.length * fontSize * lineHeight));
-  const finalY = Math.round(safeY + paddingY + Math.max(0, (availableHeight - textHeight) / 2));
+  const freeHeight = Math.max(0, availableHeight - textHeight);
+  const yOffset = verticalAlign === "top" ? 0 : verticalAlign === "bottom" ? freeHeight : freeHeight / 2;
+  const finalY = Math.round(safeY + paddingY + yOffset);
 
   return {
     text,

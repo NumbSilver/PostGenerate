@@ -20,19 +20,23 @@ pnpm dev
 - 生图模型（`gpt-image-1.5` / `qwen-image` / `gemini-3-pro-image-preview`）
 
 服务端会按以下顺序执行：
-1. 调用 NanoBanana 产出排版方案 JSON（位置、字号、颜色、对齐等）
-2. 调用生图接口生成海报 A（包含文案）
-3. 调用 edit 接口基于海报 A 去除全部文字，得到海报 B（其余尽量保持不变）
-4. （默认开启）对海报 A 做 OCR，提取文本框并和排版 JSON 融合，得到更贴近原图的文字位置
-5. （默认开启）基于海报A/B做样式分析，自动估计字号、文字颜色与是否需要半透明蒙层
-6. 进入编辑器时默认：A 作为底图，B 作为 50% 透明叠层，并自动放置文字图层
-7. 点击「应用最终底图(B)」后会隐藏 A，仅保留 B+文字用于导出
+1. 调用生图接口生成海报 A（包含文案）
+2. 调用 edit 接口基于海报 A 去除全部文字，得到海报 B（其余尽量保持不变）
+3. （默认开启）对海报 A 做 OCR，提取文本框位置
+4. （默认开启）估计 A→B 全局配准（平移/缩放/旋转），把 OCR 框映射到 B 坐标系
+5. （默认开启）基于海报 A/B 做“差分候选框”提取（定位图1有而图2无的文字区域）
+6. 采用 diff 主导 + OCR 修正融合，生成每条文案的行级锚点（line anchors）和旋转角
+7. （默认开启）视觉模型补充样式（颜色/字号/字重/对齐）
+8. 文本做自动拟合（换行/缩字号），OCR/diff 来源默认顶部贴齐，回退块默认居中
+9. 进入编辑器时默认：A 作为底图，B 作为 50% 透明叠层，并自动放置文字图层
+10. 点击「应用最终底图(B)」后会隐藏 A，仅保留 B+文字用于导出
 
-文字图层采用“框选区拟合”对齐策略：
-- 先按排版 JSON 的区块作为文字盒子（x/y/w/h）
+文字图层采用“配准 + 差分 + OCR + 样式估计 + 拟合”策略：
+- 配准先把 A 的检测结果映射到 B，降低编辑接口造成的轻微形变偏差
+- 位置由 diff 主导，OCR 做几何修正；无法识别时自动回退
+- 支持行级锚点与旋转角传递
 - 再按像素宽度逐字符换行并自动缩字号，保证尽量不溢出
-- 根据 `align` 做左/中/右对齐，并做垂直居中
-- 背景复杂时可自动给文字加半透明蒙层（panel）
+- 根据 `align` 做左/中/右对齐，非回退块优先顶部贴齐
 - 编辑器提供「自动重排文字」按钮，可对当前所有文字层二次拟合
 
 当生图模型选择 `gpt-image-1.5` 时，调用路径会切换为：
@@ -50,7 +54,6 @@ pnpm dev
 - 可选：`NANOBANANA_3P_BASE_URL`（办公网通常是 `https://genai-sg-og.tiktok-row.org`）
 - 可选：`NANOBANANA_3P_MODEL`（默认模型，页面也可临时切换；支持 `gpt-image-1.5` / `qwen-image` / `gemini-3-pro-image-preview`）
 - 可选：`NANOBANANA_3P_OPENAI_IMAGE_QUALITY`（当模型为 `gpt-image-1.5` 时使用，默认 `low`）
-- 可选：`NANOBANANA_3P_LAYOUT_MODEL`（排版 JSON 的模型，不填则复用 `NANOBANANA_3P_MODEL`）
 - 可选：`NANOBANANA_3P_OCR_MODEL`（默认 `openai_qwen-vl-ocr-latest`）
 - 可选：`NANOBANANA_3P_OCR_BASE_URL`（默认 `https://search.bytedance.net`）
 - 可选：`NANOBANANA_3P_OCR_FALLBACK_BASE_URL`
@@ -58,7 +61,8 @@ pnpm dev
 - 可选：`NANOBANANA_3P_OCR_ENABLED`（默认 `1`，设 `0` 可关闭 OCR 融合）
 - 可选：`NANOBANANA_3P_OCR_MAX_TOKENS`（默认 `1200`）
 - 可选：`NANOBANANA_3P_OCR_RATE_LIMIT_WAIT_MS`（默认 `60000`，遇到 429 后等待再重试 1 次）
-- 可选：`NANOBANANA_3P_STYLE_HINT_ENABLED`（默认 `1`，设 `0` 可关闭颜色/字号/蒙层分析）
+- 可选：`NANOBANANA_3P_VISION_MODEL`（视觉理解模型，不填则复用 OCR 模型）
+- 可选：`NANOBANANA_3P_STYLE_HINT_ENABLED`（默认 `1`，设 `0` 可关闭颜色/字号分析）
 - 可选：`NANOBANANA_3P_LOGID`
 
 未配置或请求失败时会自动回退到本地随机 SVG 生成（仍保证无文字并预留顶部留白）。
