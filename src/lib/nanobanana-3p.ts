@@ -637,3 +637,99 @@ export async function nanoBanana3pGenerateImage({
   }
   throw new Error(lastErrs.join("\n\n"));
 }
+
+export async function nanoBanana3pInjectReferenceImage({
+  baseImage,
+  referenceImage,
+  text,
+  aspectRatio,
+  imageSize = "1K",
+  seedTag,
+  width,
+  height,
+  modelOverride
+}: {
+  baseImage: { mimeType: string; base64: string };
+  referenceImage: { mimeType: string; base64: string };
+  text: string;
+  aspectRatio: string;
+  imageSize?: "1K" | "2K";
+  seedTag: string;
+  width?: number;
+  height?: number;
+  modelOverride?: string;
+}) {
+  const selectedModel = model(modelOverride);
+  if (!isOpenAIImagesModel(selectedModel)) {
+    throw new Error("Reference injection currently supports only gpt-image-1.5 via edits");
+  }
+  const id = logId(seedTag);
+  const errors: string[] = [];
+  const quality = process.env.NANOBANANA_3P_OPENAI_IMAGE_QUALITY ?? "low";
+  const size = openAIImageSize({ width, height, aspectRatio, imageSize });
+
+  for (const base of baseUrls()) {
+    const url = new URL("/gpt/openapi/online/v2/crawl/openai/images/edits", base);
+    url.searchParams.set("ak", ak());
+    try {
+      const baseAsset = await resolveUploadAsset(baseImage);
+      const referenceAsset = await resolveUploadAsset(referenceImage);
+      const form = new FormData();
+      form.append(
+        "image[]",
+        new Blob([baseAsset.bytes], { type: baseAsset.mimeType }),
+        `base.${extFromMimeType(baseAsset.mimeType)}`
+      );
+      form.append(
+        "image[]",
+        new Blob([referenceAsset.bytes], { type: referenceAsset.mimeType }),
+        `reference.${extFromMimeType(referenceAsset.mimeType)}`
+      );
+      form.append("prompt", text);
+      form.append("model", selectedModel);
+      form.append("quality", quality);
+      form.append("size", size);
+      form.append("n", "1");
+      const resp = await fetch(url.toString(), {
+        method: "POST",
+        headers: { "X-TT-LOGID": id },
+        body: form
+      });
+      const raw = await resp.text();
+      if (!resp.ok) {
+        errors.push(`${base} HTTP ${resp.status}: ${raw}`);
+        continue;
+      }
+      const json = JSON.parse(raw);
+      const image = await extractImageFromAnyResponse(json);
+      if (!image) {
+        errors.push(`${base} no image payload: ${raw.slice(0, 320)}`);
+        continue;
+      }
+      return {
+        logId: id,
+        mimeType: image.mime_type,
+        base64: image.data,
+        rawText: "",
+        prompt: text,
+        negativePrompt: undefined,
+        params: {
+          apiMode: "openai-images-edits-v2",
+          imageModel: selectedModel,
+          referenceImageUsed: true,
+          referenceImageIgnoredReason: undefined,
+          referenceImageVariant: undefined,
+          referenceStyleUsed: false,
+          referencePalette: undefined,
+          size,
+          quality,
+          referenceMaskUsed: false,
+          referenceInjection: true
+        }
+      };
+    } catch (error) {
+      errors.push(`${base} parse error: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  throw new Error(errors.join("\n\n"));
+}

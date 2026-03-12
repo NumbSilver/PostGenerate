@@ -186,8 +186,22 @@ export default function GeneratePage() {
 
   return (
     <div className="mx-auto max-w-6xl p-6">
-      <div className="mb-4 flex items-center justify-between">
+      <div className="mb-4 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
         <div className="text-xl font-semibold">先生成海报A（含字）→ 再编辑生成海报B（去字）→ 进入画布叠层调字</div>
+        <div className="flex flex-col gap-2 md:flex-row">
+          <a
+            href="/generate-structured"
+            className="inline-flex items-center justify-center rounded-lg border border-zinc-600 px-3 py-2 text-sm text-zinc-100"
+          >
+            新方案：脚本理解生成
+          </a>
+          <a
+            href="/generate-livecode"
+            className="inline-flex items-center justify-center rounded-lg border border-zinc-600 px-3 py-2 text-sm text-zinc-100"
+          >
+            新新方案：现场写布局代码
+          </a>
+        </div>
       </div>
 
       <div className="grid grid-cols-1 gap-4 md:grid-cols-5">

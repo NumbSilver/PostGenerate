@@ -5,7 +5,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { ensureDir, publicDir } from "@/lib/storage";
 import { generateFallbackPosterSvg } from "@/lib/svg-fallback";
-import { nanoBanana3pGenerateImage } from "@/lib/nanobanana-3p";
+import { nanoBanana3pGenerateImage, nanoBanana3pInjectReferenceImage } from "@/lib/nanobanana-3p";
 import {
   nanoBanana3pEstimateRegistration,
   nanoBanana3pExtractDiffCandidates,
@@ -136,6 +136,24 @@ function buildPosterATextPrompt({
     stylePrompt,
     "",
     "必须在海报中出现的文字：",
+    ...textItems.map((item) => `${item.label}: ${item.text}`)
+  ].join("\n");
+}
+
+function buildPosterAInjectPrompt({
+  stylePrompt,
+  textItems
+}: {
+  stylePrompt: string;
+  textItems: LayoutTextItem[];
+}) {
+  return [
+    "你需要在保持原海报构图与文字完全不变的前提下，注入参考图的主体元素。",
+    "严格要求：除新增参考主体外，其余区域（尤其是文字）保持一致，不得移动或重绘。",
+    "风格描述：",
+    stylePrompt,
+    "",
+    "原海报中的文字内容（必须保持原样）：",
     ...textItems.map((item) => `${item.label}: ${item.text}`)
   ].join("\n");
 }
@@ -1002,11 +1020,16 @@ export async function POST(req: Request) {
     let provider = "NanoBanana3P_A2B_OCR";
     let nanoBananaError: string | undefined;
     let ocrError: string | undefined;
+    let referenceInjectionError: string | undefined;
+    let referenceInjectionUsed = false;
+    let referenceInjectionLogId: string | undefined;
+    let referenceInjectionModel: string | undefined;
+    let referenceInjectionPrompt: string | undefined;
 
     const posterATextPrompt = buildPosterATextPrompt({ stylePrompt, textItems });
     const posterBRemoveTextPrompt = buildPosterBRemoveTextPrompt({ stylePrompt, textItems });
     try {
-      const genA = await nanoBanana3pGenerateImage({
+      const genABase = await nanoBanana3pGenerateImage({
         text: posterATextPrompt,
         aspectRatio,
         width,
@@ -1021,6 +1044,31 @@ export async function POST(req: Request) {
           ? { include_thoughts: body.thinking.include_thoughts, budget_tokens: body.thinking.budget_tokens }
           : undefined
       });
+      let genA = genABase;
+      if (body.referenceImage && body.imageModel === "gpt-image-1.5") {
+        try {
+          const injectPrompt = buildPosterAInjectPrompt({ stylePrompt, textItems });
+          const injected = await nanoBanana3pInjectReferenceImage({
+            baseImage: { mimeType: genABase.mimeType, base64: genABase.base64 },
+            referenceImage: body.referenceImage,
+            text: injectPrompt,
+            aspectRatio,
+            width,
+            height,
+            seedTag: `${seedTag}_a_inject`,
+            modelOverride: body.imageModel
+          });
+          genA = injected;
+          referenceInjectionUsed = true;
+          referenceInjectionLogId = injected.logId;
+          referenceInjectionModel = (injected.params as Record<string, unknown> | undefined)?.imageModel as
+            | string
+            | undefined;
+          referenceInjectionPrompt = injectPrompt;
+        } catch (error) {
+          referenceInjectionError = error instanceof Error ? error.message : String(error);
+        }
+      }
 
       const posterAUrl = await writeGeneratedImageFile({
         outDir,
@@ -1316,6 +1364,11 @@ export async function POST(req: Request) {
         apiModeB: (genB.params as Record<string, unknown> | undefined)?.apiMode,
         imageModelA: (genA.params as Record<string, unknown> | undefined)?.imageModel,
         imageModelB: (genB.params as Record<string, unknown> | undefined)?.imageModel,
+        referenceInjectionUsed,
+        referenceInjectionLogId,
+        referenceInjectionModel,
+        referenceInjectionPrompt,
+        referenceInjectionError,
         placementSource,
         placementSourceByKey,
         placementBlocks,
