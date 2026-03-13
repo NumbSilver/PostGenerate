@@ -42,6 +42,8 @@ type TextLayer = BaseLayer & {
   color: string;
   align: "left" | "center" | "right";
   lineHeight?: number;
+  letterSpacing?: number;
+  opacity?: number;
   stroke?: string;
   strokeWidth?: number;
   shadowColor?: string;
@@ -419,6 +421,8 @@ export default function EditorClient({ projectId }: { projectId: string }) {
                           fontStyle={layer.fontWeight >= 700 ? "bold" : "normal"}
                           align={layer.align}
                           lineHeight={layer.lineHeight ?? 1.2}
+                          letterSpacing={layer.letterSpacing}
+                          opacity={layer.opacity}
                           stroke={layer.stroke}
                           strokeWidth={layer.strokeWidth}
                           shadowColor={layer.shadowColor}

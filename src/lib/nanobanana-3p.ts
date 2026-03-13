@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { PNG } from "pngjs";
 
 export type NanoBanana3pThinking = {
   include_thoughts?: boolean;
@@ -168,6 +169,83 @@ function extractTextParts(multimodalContents: unknown[]) {
     .filter((t): t is string => typeof t === "string");
 }
 
+function quantizeColor(r: number, g: number, b: number) {
+  const q = (v: number) => Math.round(v / 16) * 16;
+  return `${q(r)},${q(g)},${q(b)}`;
+}
+
+function parseQuantizedColor(key: string) {
+  const [r, g, b] = key.split(",").map((n) => Number(n));
+  return { r: r ?? 0, g: g ?? 0, b: b ?? 0 };
+}
+
+function colorDistance(a: { r: number; g: number; b: number }, b: { r: number; g: number; b: number }) {
+  return Math.abs(a.r - b.r) + Math.abs(a.g - b.g) + Math.abs(a.b - b.b);
+}
+
+function pickBorderColors(png: PNG) {
+  const counts = new Map<string, number>();
+  const totalSamples: number[] = [];
+  const w = png.width;
+  const h = png.height;
+  const step = Math.max(1, Math.round(Math.min(w, h) / 64));
+
+  const sample = (x: number, y: number) => {
+    const idx = (y * w + x) * 4;
+    const a = png.data[idx + 3];
+    if (a < 200) return;
+    const r = png.data[idx];
+    const g = png.data[idx + 1];
+    const b = png.data[idx + 2];
+    const key = quantizeColor(r, g, b);
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+    totalSamples.push(1);
+  };
+
+  for (let x = 0; x < w; x += step) {
+    sample(x, 0);
+    sample(x, h - 1);
+  }
+  for (let y = 0; y < h; y += step) {
+    sample(0, y);
+    sample(w - 1, y);
+  }
+
+  const total = totalSamples.length || 1;
+  const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  const top = sorted.slice(0, 2).map(([key, count]) => ({
+    key,
+    count,
+    ratio: count / total
+  }));
+  return top;
+}
+
+function stripBackgroundIfNeeded(input: { mime_type: string; data: string }) {
+  if (!input.mime_type.toLowerCase().includes("png")) return input;
+  try {
+    const png = PNG.sync.read(Buffer.from(input.data, "base64"));
+    const borderColors = pickBorderColors(png).filter((item) => item.ratio >= 0.15);
+    if (!borderColors.length) return input;
+
+    const colors = borderColors.map((item) => parseQuantizedColor(item.key));
+    const tolerance = 42;
+    const data = png.data;
+    for (let i = 0; i < data.length; i += 4) {
+      const a = data[i + 3];
+      if (a === 0) continue;
+      const pixel = { r: data[i], g: data[i + 1], b: data[i + 2] };
+      if (colors.some((bg) => colorDistance(pixel, bg) <= tolerance)) {
+        data[i + 3] = 0;
+      }
+    }
+    const out = PNG.sync.write(png);
+    return { mime_type: "image/png", data: out.toString("base64") };
+  } catch {
+    return input;
+  }
+}
+
 async function fetchUrlAsBase64(url: string) {
   const resp = await fetch(url);
   if (!resp.ok) throw new Error(`Image URL fetch failed ${resp.status}: ${url}`);
@@ -264,6 +342,8 @@ export async function nanoBanana3pGenerateImage({
   imageSize = "1K",
   seedTag,
   includeNegative,
+  transparent,
+  avoidRegionsHint,
   referenceImage,
   referenceStyle,
   thinking,
@@ -277,6 +357,8 @@ export async function nanoBanana3pGenerateImage({
   imageSize?: "1K" | "2K";
   seedTag: string;
   includeNegative: boolean;
+  transparent?: boolean;
+  avoidRegionsHint?: string;
   referenceImage?: { mimeType: string; base64: string };
   referenceStyle?: { palette?: string[] };
   thinking?: NanoBanana3pThinking;
@@ -305,7 +387,14 @@ export async function nanoBanana3pGenerateImage({
         "Avoid obvious watermarks and brand logos."
       ].join("\n");
 
-  const promptText = [constraint, styleHint ?? "", "", text].join("\n").trim();
+  const transparentHint = transparent
+    ? [
+        "Background must be transparent (alpha channel).",
+        "Isolated subject only, no solid background, no frame, no box."
+      ].join("\n")
+    : "";
+
+  const promptText = [constraint, avoidRegionsHint ?? "", transparentHint, styleHint ?? "", "", text].join("\n").trim();
 
   if (isOpenAIImagesModel(selectedModel)) {
     const errors: string[] = [];
@@ -367,10 +456,11 @@ export async function nanoBanana3pGenerateImage({
           errors.push(`${base} no image payload: ${raw.slice(0, 320)}`);
           continue;
         }
+        const processed = transparent ? stripBackgroundIfNeeded(image) : image;
         return {
           logId: id,
-          mimeType: image.mime_type,
-          base64: image.data,
+          mimeType: processed.mime_type,
+          base64: processed.data,
           rawText: "",
           prompt: text,
           negativePrompt: includeNegative ? "text, letters, words, logo, watermark, typography" : undefined,
@@ -424,10 +514,11 @@ export async function nanoBanana3pGenerateImage({
           errors.push(`${base} no image payload: ${raw.slice(0, 320)}`);
           continue;
         }
+        const processed = transparent ? stripBackgroundIfNeeded(image) : image;
         return {
           logId: id,
-          mimeType: image.mime_type,
-          base64: image.data,
+          mimeType: processed.mime_type,
+          base64: processed.data,
           rawText: "",
           prompt: text,
           negativePrompt: includeNegative ? "text, letters, words, logo, watermark, typography" : undefined,
@@ -588,10 +679,11 @@ export async function nanoBanana3pGenerateImage({
         const image2 = extractInlineImage(mm2);
         const textParts2 = extractTextParts(mm2);
         if (image2) {
+          const processed = transparent ? stripBackgroundIfNeeded(image2) : image2;
           return {
             logId: id,
-            mimeType: image2.mime_type,
-            base64: image2.data,
+            mimeType: processed.mime_type,
+            base64: processed.data,
             rawText: textParts2.join(""),
             prompt: text,
             negativePrompt: includeNegative ? "text, letters, words, logo, watermark, typography" : undefined,
@@ -617,10 +709,11 @@ export async function nanoBanana3pGenerateImage({
       );
     }
 
+    const processed = transparent ? stripBackgroundIfNeeded(image) : image;
     return {
       logId: id,
-      mimeType: image.mime_type,
-      base64: image.data,
+      mimeType: processed.mime_type,
+      base64: processed.data,
       rawText: textParts.join(""),
       prompt: text,
       negativePrompt: includeNegative ? "text, letters, words, logo, watermark, typography" : undefined,

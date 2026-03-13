@@ -7,10 +7,11 @@ import { ensureDir, publicDir, writeJson, dataDir } from "@/lib/storage";
 import { nanoBanana3pGenerateImage } from "@/lib/nanobanana-3p";
 import { fitTextInBox, TEXT_LINE_HEIGHT } from "@/lib/text-alignment";
 import type { PosterImageLayer, PosterProject, PosterTextLayer } from "@/lib/types";
+import { PNG } from "pngjs";
 
 export const runtime = "nodejs";
 
-const STRUCTURE_LLM_MODEL = "gpt-5.1-2025-11-13";
+const STRUCTURE_LLM_MODEL = "gpt-5.4-2026-03-05";
 
 class HttpError extends Error {
   status: number;
@@ -24,6 +25,7 @@ const BodySchema = z.object({
   script: z.string().min(1),
   assetsText: z.string().optional(),
   styleHint: z.string().optional(),
+  readabilityLevel: z.enum(["weak", "medium", "strong"]).optional(),
   size: z.object({
     width: z.number().int().min(320).max(4096),
     height: z.number().int().min(320).max(4096)
@@ -51,6 +53,8 @@ const CommandSchema = z.discriminatedUnion("op", [
         color: z.string().optional(),
         align: z.enum(["left", "center", "right"]).optional(),
         lineHeight: z.number().optional(),
+        letterSpacing: z.number().optional(),
+        opacity: z.number().optional(),
         stroke: z.string().optional(),
         strokeWidth: z.number().optional(),
         shadowColor: z.string().optional(),
@@ -136,6 +140,8 @@ const LlmLayoutSchema = z.object({
             enable: z.boolean().optional(),
             stroke: z.string().optional(),
             strokeWidth: z.number().optional(),
+            letterSpacing: z.number().optional(),
+            opacity: z.number().optional(),
             shadowColor: z.string().optional(),
             shadowBlur: z.number().optional(),
             shadowOffsetX: z.number().optional(),
@@ -323,7 +329,7 @@ function buildTextBackdropLayer({
     padding?: number;
   };
 }): PosterImageLayer {
-  const pad = Math.max(4, Math.round(style?.padding ?? Math.max(8, Math.round(fontSize * 0.25))));
+  const pad = Math.max(6, Math.round(style?.padding ?? Math.max(10, Math.round(fontSize * 0.35))));
   const x = clamp(box.x - pad, 0, canvasWidth - 20);
   const y = clamp(box.y - pad, 0, canvasHeight - 20);
   const w = clamp(box.w + pad * 2, 20, canvasWidth);
@@ -402,6 +408,83 @@ function contrastRatio(a: { r: number; g: number; b: number }, b: { r: number; g
   return (lighter + 0.05) / (darker + 0.05);
 }
 
+function pickReadableColor(
+  background: { r: number; g: number; b: number },
+  candidates: Array<string | undefined>,
+  minRatio: number
+) {
+  const parsed = candidates
+    .map((c) => (typeof c === "string" ? { raw: c, rgb: parseColor(c) } : null))
+    .filter((v): v is { raw: string; rgb: { r: number; g: number; b: number; a: number } } => Boolean(v?.rgb));
+  let best = parsed[0];
+  let bestRatio = best ? contrastRatio(background, best.rgb) : 0;
+  for (const cand of parsed) {
+    const ratio = contrastRatio(background, cand.rgb);
+    if (ratio > bestRatio) {
+      best = cand;
+      bestRatio = ratio;
+    }
+  }
+  if (best && bestRatio >= minRatio) return { color: best.raw, ratio: bestRatio, changed: true };
+  if (best) return { color: best.raw, ratio: bestRatio, changed: true };
+  return { color: "#ffffff", ratio: contrastRatio(background, { r: 255, g: 255, b: 255 }), changed: true };
+}
+
+function sampleBoxStats(
+  png: PNG,
+  box: { x: number; y: number; w: number; h: number },
+  canvasWidth: number,
+  canvasHeight: number
+) {
+  const sx = png.width / canvasWidth;
+  const sy = png.height / canvasHeight;
+  const left = clamp(Math.round(box.x * sx), 0, png.width - 1);
+  const top = clamp(Math.round(box.y * sy), 0, png.height - 1);
+  const right = clamp(Math.round((box.x + box.w) * sx), 0, png.width - 1);
+  const bottom = clamp(Math.round((box.y + box.h) * sy), 0, png.height - 1);
+  const cols = 6;
+  const rows = 6;
+  let count = 0;
+  let rSum = 0;
+  let gSum = 0;
+  let bSum = 0;
+  let minLum = 1;
+  let maxLum = 0;
+  for (let yi = 0; yi < rows; yi += 1) {
+    const y = clamp(Math.round(top + ((bottom - top) * (yi + 0.5)) / rows), 0, png.height - 1);
+    for (let xi = 0; xi < cols; xi += 1) {
+      const x = clamp(Math.round(left + ((right - left) * (xi + 0.5)) / cols), 0, png.width - 1);
+      const idx = (y * png.width + x) * 4;
+      const a = png.data[idx + 3];
+      if (a < 16) continue;
+      const r = png.data[idx];
+      const g = png.data[idx + 1];
+      const b = png.data[idx + 2];
+      rSum += r;
+      gSum += g;
+      bSum += b;
+      const lum = relativeLuminance({ r, g, b });
+      minLum = Math.min(minLum, lum);
+      maxLum = Math.max(maxLum, lum);
+      count += 1;
+    }
+  }
+  if (!count) return null;
+  return {
+    color: { r: Math.round(rSum / count), g: Math.round(gSum / count), b: Math.round(bSum / count), a: 1 },
+    luminanceRange: maxLum - minLum
+  };
+}
+
+async function readPngSafe(absPath: string) {
+  try {
+    const buf = await fs.readFile(absPath);
+    return PNG.sync.read(buf);
+  } catch {
+    return null;
+  }
+}
+
 async function writeBase64Image({
   base64,
   mimeType,
@@ -436,6 +519,21 @@ function buildDesignStyleHint(styleHint?: string) {
   return `${base}\n用户补充风格：${styleHint.trim()}`;
 }
 
+function buildAvoidBackgroundHint(boxes: Array<{ x: number; y: number; w: number; h: number }>, width: number, height: number) {
+  if (!boxes.length) return "";
+  const items = boxes.slice(0, 6).map((b) => {
+    const x = Math.round((b.x / width) * 100);
+    const y = Math.round((b.y / height) * 100);
+    const w = Math.round((b.w / width) * 100);
+    const h = Math.round((b.h / height) * 100);
+    return `[x:${x}%, y:${y}%, w:${w}%, h:${h}%]`;
+  });
+  return [
+    "布局约束：以下区域将放置文字，请保持背景干净、低纹理、低对比、避免亮点与复杂细节：",
+    items.join(" ")
+  ].join("\n");
+}
+
 async function callLiveCodeLlm({
   script,
   assets,
@@ -451,7 +549,8 @@ async function callLiveCodeLlm({
 }): Promise<{ llm: z.infer<typeof LlmLayoutSchema>; llmContent: string; llmResponsePreview: string; logId: string }> {
   const model = STRUCTURE_LLM_MODEL;
   const ak =
-    (model === STRUCTURE_LLM_MODEL ? process.env.GPT_5_1_AK : undefined) ??
+    (model === STRUCTURE_LLM_MODEL ? process.env.GPT_5_4_AK : undefined) ??
+    process.env.GPT_5_1_AK ??
     process.env.GPT_I18N_AK ??
     process.env.NANOBANANA_AK ??
     process.env.NANOBANANA_3P_AK;
@@ -469,7 +568,7 @@ async function callLiveCodeLlm({
   "stylePolicy": {
     "contrast": { "minRatio": 4.0, "softRatio": 3.0 },
     "roles": {
-      "title": { "enable": true, "shadowColor": "rgba(0,0,0,0.6)", "shadowBlur": 12, "shadowOffsetY": 6 },
+      "title": { "enable": true, "letterSpacing": 1.5, "shadowColor": "rgba(0,0,0,0.6)", "shadowBlur": 12, "shadowOffsetY": 6 },
       "body": { "enable": true, "backdrop": { "enabled": true, "fillColor": "rgba(10,10,20,0.35)", "borderColor": "rgba(255,255,255,0.12)", "borderWidth": 1, "radius": 16, "padding": 12 } }
     }
   },
@@ -480,7 +579,7 @@ async function callLiveCodeLlm({
       "role": "title|subtitle|body|list|highlight|note",
       "text": "文本内容",
       "box": { "x": 0.08, "y": 0.12, "w": 0.84, "h": 0.22 },
-      "style": { "fontSize": 64, "fontWeight": 800, "color": "#FFFFFF", "align": "left", "lineHeight": 1.1, "stroke": "rgba(0,0,0,0.45)", "strokeWidth": 2, "shadowColor": "rgba(0,0,0,0.6)", "shadowBlur": 12, "shadowOffsetY": 6, "shadowOpacity": 0.6 },
+      "style": { "fontSize": 64, "fontWeight": 800, "color": "#FFFFFF", "align": "left", "lineHeight": 1.1, "letterSpacing": 1.2, "opacity": 1, "stroke": "rgba(0,0,0,0.45)", "strokeWidth": 2, "shadowColor": "rgba(0,0,0,0.6)", "shadowBlur": 12, "shadowOffsetY": 6, "shadowOpacity": 0.6 },
       "backdrop": { "enabled": false }
     },
     { "op": "asset", "id": "asset_1", "assetIndex": 0, "box": { "x": 0.1, "y": 0.55, "w": 0.35, "h": 0.35 } },
@@ -504,12 +603,19 @@ async function callLiveCodeLlm({
     "2) commands 的 box 坐标用 0-1 相对比例（或像素），但建议用 0-1。",
     "3) 背景 background.prompt 必须符合视觉风格，且严格禁止出现任何文字/字母/数字/logo/水印。",
     "4) 重点(highlight)要更醒目（字号/色彩/留白），列表(list)要有 bullet。",
-    "5) 只有在确实需要增强可读性时才使用阴影/描边/底图，不要默认给所有文字加效果。",
-    "6) 阴影/描边/底图的颜色必须与背景整体配色协调（例如：深色背景用冷色半透明底图，亮色背景用更浅底图），避免脏黑遮挡。",
-    "7) 如果需要底图，请优先用 text.backdrop 或 rect（并定义 fill/border/opacity），不得留空。",
-    "8) 请返回 stylePolicy（至少包含 contrast.minRatio 和常用 role 策略）。",
-    "9) 如果 assets 中某条没有 URL，但必须出现在画面里，可以用 generated 命令生成元素。",
-    "10) 如果你的系统会分离 reasoning，请确保最终 JSON 出现在最终回答的 content 中。",
+    "5) 版式必须精美、有秩序（参考 seede.ai 的风格）：对齐统一、字号节奏明确、留白克制、模块分区清晰。",
+    "6) 从以下 4 个模板中选择一个并落实到 commands（可以轻微调整）：",
+    "   A) 经典上下结构：标题区(上方1/4) → 正文区(中部) → 列表/CTA(下方)。",
+    "   B) 左文右图：左侧文字列(标题+正文+列表)，右侧元素/装饰图；文本对齐统一。",
+    "   C) 中央标题卡片：标题/副标题集中在中上，正文与列表在半透明卡片内。",
+    "   D) 强对比分区：上部纯净留白用于标题，下部复杂背景放正文+列表（需衬底）。",
+    "7) 只有在确实需要增强可读性时才使用阴影/描边/底图，但复杂背景必须增强。",
+    "8) 阴影/描边/底图的颜色必须与背景整体配色协调（例如：深色背景用冷色半透明底图，亮色背景用更浅底图），避免脏黑遮挡。",
+    "9) 如果需要底图，请优先用 text.backdrop 或 rect（并定义 fill/border/opacity），必须覆盖当前文字块的全部内容（含多行）。",
+    "10) 文本样式不要单一：在少量关键层（title/highlight）上合理使用字距(letterSpacing)、描边/阴影/轻微透明度等组合效果，并优先保证清晰可读。",
+    "11) 请返回 stylePolicy（至少包含 contrast.minRatio 和常用 role 策略）。",
+    "12) 如果 assets 中某条没有 URL，但必须出现在画面里，可以用 generated 命令生成元素（要求透明背景或 SVG）。",
+    "13) 如果你的系统会分离 reasoning，请确保最终 JSON 出现在最终回答的 content 中。",
     "",
     `画布尺寸：${width}x${height}`,
     `设计风格约束：${buildDesignStyleHint(styleHint)}`,
@@ -526,7 +632,7 @@ async function callLiveCodeLlm({
   const body = {
     stream: false,
     model,
-    max_tokens: 4000,
+    max_tokens: 6000,
     messages: [
       {
         role: "user",
@@ -609,12 +715,24 @@ export async function POST(req: Request) {
       height
     });
 
+    const textBoxes = llm.commands
+      .filter((cmd) => cmd.op === "text")
+      .map((cmd) => normalizeBox(cmd.box, width, height))
+      .map((box) => ({
+        x: Math.max(0, box.x - Math.round(box.w * 0.05)),
+        y: Math.max(0, box.y - Math.round(box.h * 0.08)),
+        w: Math.min(width, box.w + Math.round(box.w * 0.1)),
+        h: Math.min(height, box.h + Math.round(box.h * 0.16))
+      }));
+    const avoidRegionsHint = buildAvoidBackgroundHint(textBoxes, width, height);
+
     const background = await nanoBanana3pGenerateImage({
       text: llm.background.prompt,
       aspectRatio: `${width}:${height}`,
       imageSize: width * height > 2_000_000 ? "2K" : "1K",
       seedTag: `bg_${nanoid()}`,
-      includeNegative: true
+      includeNegative: true,
+      avoidRegionsHint
     });
     const backgroundFile = await writeBase64Image({
       base64: background.base64,
@@ -622,14 +740,63 @@ export async function POST(req: Request) {
       prefix: "bg"
     });
     const backgroundUrl = backgroundFile.url;
+    const backgroundAbs = path.join(publicDir("generated-livecode"), backgroundFile.filename);
+    const backgroundPng = await readPngSafe(backgroundAbs);
 
     const palette = llm.palette ?? {};
     const fonts = { ...DEFAULT_FONTS, ...(llm.fonts ?? {}) };
     const stylePolicy = llm.stylePolicy ?? {};
+    const readabilityLevel = body.readabilityLevel ?? "medium";
+    const readabilityMap = {
+      weak: { minRatio: 3.2, softRatio: 2.6 },
+      medium: { minRatio: 4.0, softRatio: 3.0 },
+      strong: { minRatio: 5.0, softRatio: 4.2 }
+    } as const;
+    const defaultRolePolicy: Record<string, any> = {
+      title: {
+        enable: true,
+        shadowColor: "rgba(0,0,0,0.6)",
+        shadowBlur: 12,
+        shadowOffsetY: 6,
+        stroke: "rgba(0,0,0,0.4)",
+        strokeWidth: 2
+      },
+      highlight: {
+        enable: true,
+        shadowColor: "rgba(0,0,0,0.6)",
+        shadowBlur: 10,
+        shadowOffsetY: 5,
+        stroke: "rgba(0,0,0,0.35)",
+        strokeWidth: 2
+      },
+      body: {
+        enable: true,
+        backdrop: {
+          enabled: true,
+          fillColor: "rgba(10,10,20,0.35)",
+          borderColor: "rgba(255,255,255,0.12)",
+          borderWidth: 1,
+          radius: 16,
+          padding: 12
+        }
+      },
+      list: {
+        enable: true,
+        backdrop: {
+          enabled: true,
+          fillColor: "rgba(10,10,20,0.35)",
+          borderColor: "rgba(255,255,255,0.12)",
+          borderWidth: 1,
+          radius: 14,
+          padding: 10
+        }
+      },
+      note: { enable: true }
+    };
     const backgroundColor =
       parseColor(palette.background) ?? parseColor("#0b0c10") ?? { r: 11, g: 12, b: 16, a: 1 };
-    const minRatio = stylePolicy.contrast?.minRatio ?? 4;
-    const softRatio = stylePolicy.contrast?.softRatio ?? Math.max(3, minRatio - 1);
+    const minRatio = readabilityMap[readabilityLevel].minRatio;
+    const softRatio = readabilityMap[readabilityLevel].softRatio;
 
     const imageLayers: PosterImageLayer[] = [];
     const textLayers: PosterTextLayer[] = [];
@@ -654,7 +821,7 @@ export async function POST(req: Request) {
                 : Math.round(height * 0.033)
         );
         const fontWeight = cmd.style?.fontWeight ?? (role === "title" || role === "highlight" ? 800 : 500);
-        const color = isHexColor(cmd.style?.color)
+        const baseColor = isHexColor(cmd.style?.color)
           ? (cmd.style?.color as string)
           : role === "highlight"
             ? isHexColor(palette.accent)
@@ -682,16 +849,34 @@ export async function POST(req: Request) {
           autoGrow: true
         });
 
-        const rolePolicy = stylePolicy.roles?.[role];
-        const textColorParsed = parseColor(color);
-        const contrast =
-          backgroundColor && textColorParsed ? contrastRatio(backgroundColor, textColorParsed) : minRatio + 1;
+        const rolePolicy = stylePolicy.roles?.[role] ?? defaultRolePolicy[role];
+        const sampled = backgroundPng ? sampleBoxStats(backgroundPng, fitted, width, height) : null;
+        const localBg = sampled?.color ?? backgroundColor;
+        const colorPick = localBg
+          ? pickReadableColor(localBg, [baseColor, palette.primary, palette.secondary, palette.accent, "#ffffff", "#0b0c10"], minRatio)
+          : { color: baseColor, ratio: minRatio + 1, changed: false };
+        const color = colorPick.color;
+        const contrast = localBg ? colorPick.ratio : minRatio + 1;
         const needsEnhance = contrast < minRatio;
         const softEnhance = contrast < softRatio;
-        const shouldEnhance = (needsEnhance || softEnhance) && rolePolicy?.enable;
+        const complexBg = typeof sampled?.luminanceRange === "number" && sampled.luminanceRange > 0.35;
+        const roleNeedsSafe = role === "body" || role === "list" || role === "note";
+        const shouldEnhance = ((needsEnhance || softEnhance) && rolePolicy?.enable) || (complexBg && roleNeedsSafe);
 
         const stroke = cmd.style?.stroke ?? (shouldEnhance ? rolePolicy?.stroke : undefined);
         const strokeWidth = cmd.style?.strokeWidth ?? (shouldEnhance ? rolePolicy?.strokeWidth : undefined);
+        const letterSpacing =
+          typeof cmd.style?.letterSpacing === "number"
+            ? cmd.style.letterSpacing
+            : shouldEnhance
+              ? rolePolicy?.letterSpacing
+              : undefined;
+        const opacity =
+          typeof cmd.style?.opacity === "number"
+            ? clamp(cmd.style.opacity, 0, 1)
+            : shouldEnhance && typeof rolePolicy?.opacity === "number"
+              ? clamp(rolePolicy.opacity, 0, 1)
+              : undefined;
         const shadowColor = cmd.style?.shadowColor ?? (shouldEnhance ? rolePolicy?.shadowColor : undefined);
         const shadowBlur = cmd.style?.shadowBlur ?? (shouldEnhance ? rolePolicy?.shadowBlur : undefined);
         const shadowOffsetX = cmd.style?.shadowOffsetX ?? (shouldEnhance ? rolePolicy?.shadowOffsetX : undefined);
@@ -738,6 +923,8 @@ export async function POST(req: Request) {
           color,
           align: fitted.align,
           lineHeight: fitted.lineHeight,
+          letterSpacing,
+          opacity,
           stroke,
           strokeWidth,
           shadowColor,
@@ -780,11 +967,12 @@ export async function POST(req: Request) {
       if (cmd.op === "generated") {
         const box = normalizeBox(cmd.box, width, height);
         const generated = await nanoBanana3pGenerateImage({
-          text: cmd.prompt,
+          text: `${cmd.prompt}\n透明背景/alpha 通道，单体元素，禁止实心背景或边框。`,
           aspectRatio: `${Math.max(1, Math.round(box.w))}:${Math.max(1, Math.round(box.h))}`,
           imageSize: "1K",
           seedTag: `el_${nanoid()}`,
-          includeNegative: true
+          includeNegative: true,
+          transparent: true
         });
         const saved = await writeBase64Image({
           base64: generated.base64,
@@ -851,7 +1039,7 @@ export async function POST(req: Request) {
         background: { url: backgroundUrl }
       },
       meta: {
-        provider: "gpt-5.1-2025-11-13",
+        provider: STRUCTURE_LLM_MODEL,
         prompt: llm.background.prompt,
         negativePrompt: llm.background.negativePrompt,
         params: {

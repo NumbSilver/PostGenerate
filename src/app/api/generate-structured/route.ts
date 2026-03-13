@@ -7,10 +7,11 @@ import { ensureDir, publicDir, writeJson, dataDir } from "@/lib/storage";
 import { nanoBanana3pGenerateImage } from "@/lib/nanobanana-3p";
 import { fitTextInBox, TEXT_LINE_HEIGHT } from "@/lib/text-alignment";
 import type { PosterImageLayer, PosterProject, PosterTextLayer } from "@/lib/types";
+import { PNG } from "pngjs";
 
 export const runtime = "nodejs";
 
-const STRUCTURE_LLM_MODEL = "gpt-5.1-2025-11-13";
+const STRUCTURE_LLM_MODEL = "gpt-5.4-2026-03-05";
 
 class HttpError extends Error {
   status: number;
@@ -24,6 +25,7 @@ const BodySchema = z.object({
   script: z.string().min(1),
   assetsText: z.string().optional(),
   styleHint: z.string().optional(),
+  readabilityLevel: z.enum(["weak", "medium", "strong"]).optional(),
   size: z.object({
     width: z.number().int().min(320).max(4096),
     height: z.number().int().min(320).max(4096)
@@ -46,6 +48,8 @@ const LlmPlanSchema = z.object({
       color: z.string().optional(),
       align: z.enum(["left", "center", "right"]).optional(),
       lineHeight: z.number().optional(),
+      letterSpacing: z.number().optional(),
+      opacity: z.number().optional(),
       stroke: z.string().optional(),
       strokeWidth: z.number().optional(),
       shadowColor: z.string().optional(),
@@ -121,6 +125,134 @@ function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
 }
 
+function parseColor(input?: string) {
+  if (!input) return null;
+  const value = input.trim();
+  const hexMatch = value.match(/^#([0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i);
+  if (hexMatch) {
+    const hex = hexMatch[1];
+    if (hex.length === 3) {
+      const r = parseInt(hex[0] + hex[0], 16);
+      const g = parseInt(hex[1] + hex[1], 16);
+      const b = parseInt(hex[2] + hex[2], 16);
+      return { r, g, b, a: 1 };
+    }
+    if (hex.length === 6 || hex.length === 8) {
+      const r = parseInt(hex.slice(0, 2), 16);
+      const g = parseInt(hex.slice(2, 4), 16);
+      const b = parseInt(hex.slice(4, 6), 16);
+      const a = hex.length === 8 ? parseInt(hex.slice(6, 8), 16) / 255 : 1;
+      return { r, g, b, a };
+    }
+  }
+  const rgbMatch = value.match(/^rgba?\\(([^)]+)\\)$/i);
+  if (rgbMatch) {
+    const parts = rgbMatch[1].split(",").map((v) => v.trim());
+    const r = Number(parts[0]);
+    const g = Number(parts[1]);
+    const b = Number(parts[2]);
+    const a = parts.length > 3 ? Number(parts[3]) : 1;
+    if ([r, g, b, a].every((n) => Number.isFinite(n))) return { r, g, b, a };
+  }
+  return null;
+}
+
+function relativeLuminance({ r, g, b }: { r: number; g: number; b: number }) {
+  const toLinear = (c: number) => {
+    const v = c / 255;
+    return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+  };
+  const R = toLinear(r);
+  const G = toLinear(g);
+  const B = toLinear(b);
+  return 0.2126 * R + 0.7152 * G + 0.0722 * B;
+}
+
+function contrastRatio(a: { r: number; g: number; b: number }, b: { r: number; g: number; b: number }) {
+  const L1 = relativeLuminance(a);
+  const L2 = relativeLuminance(b);
+  const lighter = Math.max(L1, L2);
+  const darker = Math.min(L1, L2);
+  return (lighter + 0.05) / (darker + 0.05);
+}
+
+function pickReadableColor(
+  background: { r: number; g: number; b: number },
+  candidates: Array<string | undefined>,
+  minRatio: number
+) {
+  const parsed = candidates
+    .map((c) => (typeof c === "string" ? { raw: c, rgb: parseColor(c) } : null))
+    .filter((v): v is { raw: string; rgb: { r: number; g: number; b: number; a: number } } => Boolean(v?.rgb));
+  let best = parsed[0];
+  let bestRatio = best ? contrastRatio(background, best.rgb) : 0;
+  for (const cand of parsed) {
+    const ratio = contrastRatio(background, cand.rgb);
+    if (ratio > bestRatio) {
+      best = cand;
+      bestRatio = ratio;
+    }
+  }
+  if (best && bestRatio >= minRatio) return { color: best.raw, ratio: bestRatio, changed: true };
+  if (best) return { color: best.raw, ratio: bestRatio, changed: true };
+  return { color: "#ffffff", ratio: contrastRatio(background, { r: 255, g: 255, b: 255 }), changed: true };
+}
+
+function sampleBoxStats(
+  png: PNG,
+  box: { x: number; y: number; w: number; h: number },
+  canvasWidth: number,
+  canvasHeight: number
+) {
+  const sx = png.width / canvasWidth;
+  const sy = png.height / canvasHeight;
+  const left = clamp(Math.round(box.x * sx), 0, png.width - 1);
+  const top = clamp(Math.round(box.y * sy), 0, png.height - 1);
+  const right = clamp(Math.round((box.x + box.w) * sx), 0, png.width - 1);
+  const bottom = clamp(Math.round((box.y + box.h) * sy), 0, png.height - 1);
+  const cols = 6;
+  const rows = 6;
+  let count = 0;
+  let rSum = 0;
+  let gSum = 0;
+  let bSum = 0;
+  let minLum = 1;
+  let maxLum = 0;
+  for (let yi = 0; yi < rows; yi += 1) {
+    const y = clamp(Math.round(top + ((bottom - top) * (yi + 0.5)) / rows), 0, png.height - 1);
+    for (let xi = 0; xi < cols; xi += 1) {
+      const x = clamp(Math.round(left + ((right - left) * (xi + 0.5)) / cols), 0, png.width - 1);
+      const idx = (y * png.width + x) * 4;
+      const a = png.data[idx + 3];
+      if (a < 16) continue;
+      const r = png.data[idx];
+      const g = png.data[idx + 1];
+      const b = png.data[idx + 2];
+      rSum += r;
+      gSum += g;
+      bSum += b;
+      const lum = relativeLuminance({ r, g, b });
+      minLum = Math.min(minLum, lum);
+      maxLum = Math.max(maxLum, lum);
+      count += 1;
+    }
+  }
+  if (!count) return null;
+  return {
+    color: { r: Math.round(rSum / count), g: Math.round(gSum / count), b: Math.round(bSum / count), a: 1 },
+    luminanceRange: maxLum - minLum
+  };
+}
+
+async function readPngSafe(absPath: string) {
+  try {
+    const buf = await fs.readFile(absPath);
+    return PNG.sync.read(buf);
+  } catch {
+    return null;
+  }
+}
+
 function parseAssets(input?: string): AssetInput[] {
   if (!input) return [];
   return input
@@ -142,6 +274,21 @@ function extFromMimeType(mimeType: string) {
   if (lower.includes("webp")) return "webp";
   if (lower.includes("png")) return "png";
   return "png";
+}
+
+function buildAvoidBackgroundHint(boxes: Array<{ x: number; y: number; w: number; h: number }>, width: number, height: number) {
+  if (!boxes.length) return "";
+  const items = boxes.slice(0, 6).map((b) => {
+    const x = Math.round((b.x / width) * 100);
+    const y = Math.round((b.y / height) * 100);
+    const w = Math.round((b.w / width) * 100);
+    const h = Math.round((b.h / height) * 100);
+    return `[x:${x}%, y:${y}%, w:${w}%, h:${h}%]`;
+  });
+  return [
+    "布局约束：以下区域将放置文字，请保持背景干净、低纹理、低对比、避免亮点与复杂细节：",
+    items.join(" ")
+  ].join("\n");
 }
 
 function normalizeRatio(value: number, size: number) {
@@ -231,7 +378,7 @@ function buildTextBackdropLayer({
     padding?: number;
   };
 }): PosterImageLayer {
-  const pad = Math.max(4, Math.round(style?.padding ?? Math.max(8, Math.round(fontSize * 0.25))));
+  const pad = Math.max(6, Math.round(style?.padding ?? Math.max(10, Math.round(fontSize * 0.35))));
   const x = clamp(box.x - pad, 0, canvasWidth - 20);
   const y = clamp(box.y - pad, 0, canvasHeight - 20);
   const w = clamp(box.w + pad * 2, 20, canvasWidth);
@@ -308,7 +455,8 @@ async function callStructureLlm({
 }) {
   const model = STRUCTURE_LLM_MODEL;
   const ak =
-    (model === STRUCTURE_LLM_MODEL ? process.env.GPT_5_1_AK : undefined) ??
+    (model === STRUCTURE_LLM_MODEL ? process.env.GPT_5_4_AK : undefined) ??
+    process.env.GPT_5_1_AK ??
     process.env.GPT_I18N_AK ??
     process.env.NANOBANANA_AK ??
     process.env.NANOBANANA_3P_AK;
@@ -325,7 +473,7 @@ async function callStructureLlm({
       "role": "title|subtitle|body|list|highlight|note",
       "text": "文本内容",
       "x": 0.08, "y": 0.12, "w": 0.84, "h": 0.22,
-      "fontSize": 64, "fontWeight": 700, "color": "#FFFFFF", "align": "left", "lineHeight": 1.1
+      "fontSize": 64, "fontWeight": 700, "color": "#FFFFFF", "align": "left", "lineHeight": 1.1, "letterSpacing": 1.2, "opacity": 1
     }
   ],
   "palette": { "background": "#0b0c10", "primary": "#ffffff", "secondary": "#b9c0cc", "accent": "#00f5d4" },
@@ -352,11 +500,19 @@ async function callStructureLlm({
     "2) fontSize 用像素值。",
     "3) 不要输出 markdown，不要解释文字。",
     "4) textBlocks 至少包含标题。",
-    "5) elements 只放需要出现在画面的素材或需生图的特殊元素。",
-    "6) 阴影/描边/底图(backdrop)只在确实需要提升可读性时才使用，不要默认给所有文字加效果。",
-    "7) 阴影/描边/底图的颜色必须与背景整体配色协调，避免脏黑遮挡；需要你完整定义颜色与透明度。",
-    "8) 如果需要底图，请在 textBlocks[n].backdrop 中定义（enabled=true + fillColor/borderColor 等）。",
-    "9) 如果你的系统会分离 reasoning，请确保最终 JSON 出现在最终回答的 content 中。",
+    "5) 版式必须精美、有秩序（参考 seede.ai 的风格）：对齐统一、字号节奏明确、留白克制、模块分区清晰。",
+    "6) 从以下 4 个模板中选择一个并落实到 textBlocks：",
+    "   A) 经典上下结构：标题区(上方1/4) → 正文区(中部) → 列表/CTA(下方)。",
+    "   B) 左文右图：左侧文字列(标题+正文+列表)，右侧元素/装饰图；文本对齐统一。",
+    "   C) 中央标题卡片：标题/副标题集中在中上，正文与列表在半透明卡片内。",
+    "   D) 强对比分区：上部纯净留白用于标题，下部复杂背景放正文+列表（需衬底）。",
+    "7) elements 只放需要出现在画面的素材或需生图的特殊元素。",
+    "8) 阴影/描边/底图(backdrop)只在确实需要提升可读性时才使用，但复杂背景必须增强。",
+    "9) 阴影/描边/底图的颜色必须与背景整体配色协调，避免脏黑遮挡；需要你完整定义颜色与透明度。",
+    "10) 如果需要底图，请在 textBlocks[n].backdrop 中定义（enabled=true + fillColor/borderColor 等），且必须覆盖该文字块全部内容。",
+    "11) 文本样式不要单一：可在标题/重点上使用字距(letterSpacing)、描边/阴影/轻微透明度等组合效果。",
+    "12) 如果使用 elements 生图，请确保元素为透明背景或 SVG。",
+    "13) 如果你的系统会分离 reasoning，请确保最终 JSON 出现在最终回答的 content 中。",
     "",
     `画布尺寸：${width}x${height}`,
     styleHint?.trim() ? `风格提示：${styleHint.trim()}` : "风格提示：延续当前产品的简洁科技感与高对比海报风格。",
@@ -472,23 +628,42 @@ export async function POST(req: Request) {
       height
     });
 
-    const background = await nanoBanana3pGenerateImage({
-      text: plan.background.prompt,
-      aspectRatio: `${width}:${height}`,
-      imageSize: width * height > 2_000_000 ? "2K" : "1K",
-      seedTag: `bg_${nanoid()}`,
-      includeNegative: true
-    });
+  const textBoxes = plan.textBlocks.map((block) => normalizeBox(block, width, height)).map((box) => ({
+    x: Math.max(0, box.x - Math.round(box.w * 0.05)),
+    y: Math.max(0, box.y - Math.round(box.h * 0.08)),
+    w: Math.min(width, box.w + Math.round(box.w * 0.1)),
+    h: Math.min(height, box.h + Math.round(box.h * 0.16))
+  }));
+  const avoidRegionsHint = buildAvoidBackgroundHint(textBoxes, width, height);
 
-    const backgroundFile = await writeBase64Image({
-      base64: background.base64,
-      mimeType: background.mimeType,
-      prefix: "bg"
-    });
-    const backgroundUrl = backgroundFile.url;
+  const background = await nanoBanana3pGenerateImage({
+    text: plan.background.prompt,
+    aspectRatio: `${width}:${height}`,
+    imageSize: width * height > 2_000_000 ? "2K" : "1K",
+    seedTag: `bg_${nanoid()}`,
+    includeNegative: true,
+    avoidRegionsHint
+  });
 
-    const palette = plan.palette ?? {};
-    const fonts = { ...DEFAULT_FONTS, ...(plan.fonts ?? {}) };
+  const backgroundFile = await writeBase64Image({
+    base64: background.base64,
+    mimeType: background.mimeType,
+    prefix: "bg"
+  });
+  const backgroundUrl = backgroundFile.url;
+  const backgroundAbs = path.join(publicDir("generated-structured"), backgroundFile.filename);
+  const backgroundPng = await readPngSafe(backgroundAbs);
+
+  const palette = plan.palette ?? {};
+  const fonts = { ...DEFAULT_FONTS, ...(plan.fonts ?? {}) };
+  const fallbackBg = parseColor(palette.background) ?? { r: 11, g: 12, b: 16, a: 1 };
+  const readabilityLevel = body.readabilityLevel ?? "medium";
+  const readabilityMap = {
+    weak: { minRatio: 3.2 },
+    medium: { minRatio: 4.0 },
+    strong: { minRatio: 5.0 }
+  } as const;
+  const minRatio = readabilityMap[readabilityLevel].minRatio;
 
   const imageLayers: PosterImageLayer[] = [];
   const textLayers: PosterTextLayer[] = plan.textBlocks.map((block, index) => {
@@ -506,7 +681,7 @@ export async function POST(req: Request) {
       role === "title" ? Math.round(height * 0.07) : role === "highlight" ? Math.round(height * 0.05) : Math.round(height * 0.035)
     );
     const fontWeight = block.fontWeight ?? (role === "title" || role === "highlight" ? 800 : 500);
-    const color = isHexColor(block.color)
+    const baseColor = isHexColor(block.color)
       ? (block.color as string)
       : role === "highlight"
         ? (isHexColor(palette.accent) ? (palette.accent as string) : "#00f5d4")
@@ -530,6 +705,21 @@ export async function POST(req: Request) {
       autoGrow: true
     });
 
+    const sampled = backgroundPng ? sampleBoxStats(backgroundPng, fitted, width, height) : null;
+    const bgColor = sampled?.color ?? fallbackBg;
+    const colorPick = pickReadableColor(bgColor, [baseColor, palette.primary, palette.secondary, palette.accent, "#ffffff", "#0b0c10"], minRatio);
+    const color = colorPick.color;
+    const ratio = colorPick.ratio;
+    const complexBg = typeof sampled?.luminanceRange === "number" && sampled.luminanceRange > 0.35;
+    const roleNeedsSafe = role === "body" || role === "list" || role === "note";
+    const needEnhance = ratio < minRatio || (complexBg && roleNeedsSafe);
+    const effectStroke = block.stroke ?? (needEnhance ? "rgba(0,0,0,0.45)" : undefined);
+    const effectStrokeWidth = block.strokeWidth ?? (needEnhance ? 2 : undefined);
+    const effectShadowColor = block.shadowColor ?? (needEnhance ? "rgba(0,0,0,0.6)" : undefined);
+    const effectShadowBlur = block.shadowBlur ?? (needEnhance ? 10 : undefined);
+    const effectShadowOffsetY = block.shadowOffsetY ?? (needEnhance ? 6 : undefined);
+    const effectShadowOpacity = block.shadowOpacity ?? (needEnhance ? 0.6 : undefined);
+
     const textLayer: PosterTextLayer = {
       id: `layer_${block.id}`,
       type: "text",
@@ -546,16 +736,18 @@ export async function POST(req: Request) {
       color,
       align: fitted.align,
       lineHeight: fitted.lineHeight,
-      stroke: block.stroke,
-      strokeWidth: block.strokeWidth,
-      shadowColor: block.shadowColor,
-      shadowBlur: block.shadowBlur,
+      letterSpacing: block.letterSpacing,
+      opacity: typeof block.opacity === "number" ? clamp(block.opacity, 0, 1) : undefined,
+      stroke: effectStroke,
+      strokeWidth: effectStrokeWidth,
+      shadowColor: effectShadowColor,
+      shadowBlur: effectShadowBlur,
       shadowOffsetX: block.shadowOffsetX,
-      shadowOffsetY: block.shadowOffsetY,
-      shadowOpacity: block.shadowOpacity
+      shadowOffsetY: effectShadowOffsetY,
+      shadowOpacity: effectShadowOpacity
     };
 
-    if (block.backdrop?.enabled) {
+    if (block.backdrop?.enabled || needEnhance) {
       imageLayers.push(
         buildTextBackdropLayer({
           box: { x: textLayer.x, y: textLayer.y, w: textLayer.w, h: textLayer.h },
@@ -564,11 +756,11 @@ export async function POST(req: Request) {
           z: textLayer.z - 1,
           fontSize: textLayer.fontSize,
           style: {
-            fillColor: block.backdrop.fillColor,
-            borderColor: block.backdrop.borderColor,
-            borderWidth: block.backdrop.borderWidth,
-            radius: block.backdrop.radius,
-            padding: block.backdrop.padding
+            fillColor: block.backdrop?.fillColor ?? "rgba(10,10,20,0.35)",
+            borderColor: block.backdrop?.borderColor ?? "rgba(255,255,255,0.12)",
+            borderWidth: block.backdrop?.borderWidth ?? 1,
+            radius: block.backdrop?.radius ?? Math.max(12, Math.round(textLayer.fontSize * 0.35)),
+            padding: block.backdrop?.padding
           }
         })
       );
@@ -598,14 +790,15 @@ export async function POST(req: Request) {
       } else {
         if (!elementPrompt) {
           const label = element.label ?? asset?.label ?? "decorative element";
-          elementPrompt = `${label}，与海报主风格一致，真实光影与细节，单体元素。`;
+          elementPrompt = `${label}，与海报主风格一致，真实光影与细节，单体元素，透明背景/alpha 通道。`;
         }
         const generated = await nanoBanana3pGenerateImage({
-          text: elementPrompt,
+          text: `${elementPrompt}\n透明背景/alpha 通道，禁止实心背景或边框。`,
           aspectRatio: `${Math.max(1, Math.round(box.w))}:${Math.max(1, Math.round(box.h))}`,
           imageSize: "1K",
           seedTag: `el_${nanoid()}`,
-          includeNegative: true
+          includeNegative: true,
+          transparent: true
         });
         const saved = await writeBase64Image({
           base64: generated.base64,
@@ -647,7 +840,7 @@ export async function POST(req: Request) {
         background: { url: backgroundUrl }
       },
       meta: {
-        provider: "gpt-5.1-2025-11-13",
+        provider: STRUCTURE_LLM_MODEL,
         prompt: plan.background.prompt,
         negativePrompt: plan.background.negativePrompt,
         params: {

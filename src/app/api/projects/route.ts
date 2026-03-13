@@ -38,6 +38,8 @@ const BodySchema = z.object({
           color: z.string(),
           align: z.union([z.literal("left"), z.literal("center"), z.literal("right")]),
           lineHeight: z.number().min(0.8).max(3).optional(),
+          letterSpacing: z.number().optional(),
+          opacity: z.number().min(0).max(1).optional(),
           stroke: z.string().optional(),
           strokeWidth: z.number().optional(),
           shadowColor: z.string().optional(),

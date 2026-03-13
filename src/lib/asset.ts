@@ -3,7 +3,12 @@ import { promises as fs } from "node:fs";
 import { publicDir } from "@/lib/storage";
 
 export function isLocalPublicUrl(url: string) {
-  return url.startsWith("/generated/") || url.startsWith("/uploads/");
+  return (
+    url.startsWith("/generated/") ||
+    url.startsWith("/generated-livecode/") ||
+    url.startsWith("/generated-structured/") ||
+    url.startsWith("/uploads/")
+  );
 }
 
 export async function publicUrlToAbsolutePath(url: string) {
@@ -29,4 +34,3 @@ export async function readAsDataUrl(url: string): Promise<string | null> {
             : "application/octet-stream";
   return `data:${mime};base64,${buf.toString("base64")}`;
 }
-

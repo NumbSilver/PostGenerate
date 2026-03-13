@@ -21,6 +21,7 @@ export default function GenerateLiveCodePage() {
   const [styleHint, setStyleHint] = useState("");
   const [width, setWidth] = useState(1080);
   const [height, setHeight] = useState(1920);
+  const [readability, setReadability] = useState<"weak" | "medium" | "strong">("medium");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<GenerateResult | null>(null);
@@ -40,6 +41,7 @@ export default function GenerateLiveCodePage() {
           script,
           assetsText,
           styleHint,
+          readabilityLevel: readability,
           size: { width, height }
         })
       });
@@ -109,6 +111,18 @@ export default function GenerateLiveCodePage() {
                 onChange={(e) => setHeight(Number(e.target.value))}
                 className="w-full rounded-lg border border-zinc-700 bg-zinc-900 p-2 text-sm"
               />
+            </div>
+            <div className="col-span-2">
+              <label className="mb-2 block text-sm text-zinc-300">文字可读性增强</label>
+              <select
+                value={readability}
+                onChange={(e) => setReadability(e.target.value as "weak" | "medium" | "strong")}
+                className="w-full rounded-lg border border-zinc-700 bg-zinc-900 p-2 text-sm"
+              >
+                <option value="weak">弱（更克制）</option>
+                <option value="medium">中（默认）</option>
+                <option value="strong">强（更清晰）</option>
+              </select>
             </div>
           </div>
 

@@ -15,20 +15,20 @@ function safeExt(name: string) {
 export async function POST(req: Request) {
   const form = await req.formData();
   const file = form.get("file");
-  if (!file || !(file instanceof File)) {
+  if (!file || !(file instanceof Blob)) {
     return new NextResponse("Missing file", { status: 400 });
   }
 
-  const ext = safeExt(file.name);
+  const filename = typeof (file as { name?: string }).name === "string" ? (file as { name: string }).name : "upload.png";
+  const ext = safeExt(filename);
   const id = `up_${nanoid()}`;
   const outDir = publicDir("uploads");
   await ensureDir(outDir);
-  const filename = `${id}${ext}`;
-  const abs = path.join(outDir, filename);
+  const outputName = `${id}${ext}`;
+  const abs = path.join(outDir, outputName);
 
   const buf = Buffer.from(await file.arrayBuffer());
   await fs.writeFile(abs, buf);
 
-  return NextResponse.json({ url: `/uploads/${filename}` });
+  return NextResponse.json({ url: `/uploads/${outputName}` });
 }
-

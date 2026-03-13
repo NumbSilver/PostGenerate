@@ -24,6 +24,8 @@ export type PosterTextLayer = PosterLayerBase & {
   color: string;
   align: "left" | "center" | "right";
   lineHeight?: number;
+  letterSpacing?: number;
+  opacity?: number;
   stroke?: string;
   strokeWidth?: number;
   shadowColor?: string;
