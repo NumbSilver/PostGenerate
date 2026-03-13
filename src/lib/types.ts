@@ -24,6 +24,13 @@ export type PosterTextLayer = PosterLayerBase & {
   color: string;
   align: "left" | "center" | "right";
   lineHeight?: number;
+  stroke?: string;
+  strokeWidth?: number;
+  shadowColor?: string;
+  shadowBlur?: number;
+  shadowOffsetX?: number;
+  shadowOffsetY?: number;
+  shadowOpacity?: number;
 };
 
 export type PosterImageLayer = PosterLayerBase & {
@@ -32,7 +39,7 @@ export type PosterImageLayer = PosterLayerBase & {
   opacity?: number;
   visible?: boolean;
   locked?: boolean;
-  role?: "asset" | "guide_b_overlay";
+  role?: "asset" | "guide_b_overlay" | "text_backdrop";
 };
 
 export type PosterLayer = PosterTextLayer | PosterImageLayer;

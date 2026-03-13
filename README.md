@@ -15,12 +15,136 @@ pnpm dev
 ## 新增：现场写布局“代码”方案（不影响旧方案）
 
 打开 `http://127.0.0.1:5174/generate-livecode`。
+Livecode 独立技术方案见 `LIVE_CODE_TECH_SPEC.md`。
 
 该方案会：
 - 让大模型先理解脚本结构（标题/正文/列表/重点）
 - 生成一段可读的“布局伪代码（类似 remotion/JS 思路）”用于解释布局
 - 同时输出可执行的受限 `commands`（JSON program），服务端据此生成背景/元素并写入项目
 - 最终进入现有 Canvas 编辑器（Konva）进行微调与导出
+
+### Livecode 技术方案（关键部分）
+
+#### 整体流程
+1. 前端提交：脚本 + 素材清单 + 画布尺寸 + 风格提示（可选）
+2. 后端调用结构理解 LLM：产出 `layoutCode + commands + background + stylePolicy`
+3. 解析 JSON（严格校验 schema），并将 `stylePolicy` 写入 project meta
+4. 背景亮度校正（基于 palette.background + 文本色）：
+   - 计算文字与背景的对比度（contrast ratio）
+   - 仅在低于 `stylePolicy.contrast.minRatio` 时触发增强（描边/阴影/半透明底图）
+5. 执行 `commands`：
+   - `text` 生成文字层
+   - `asset` / `generated` 生成图片层
+   - `rect` 生成可控的强调底图层
+6. 落盘为 `project.json` → 进入 Konva 编辑器（可编辑/导出）
+
+#### 依赖模型和服务
+- 结构理解 LLM：`gpt-5.1-2025-11-13`（通过 `NANOBANANA_3P_BASE_URL`）
+- LLM AK：优先 `GPT_5_1_AK`，否则回退 `GPT_I18N_AK / NANOBANANA_3P_AK`
+- 生图服务：`NANOBANANA_3P_MODEL`（默认 `gpt-image-1.5`）
+- 视觉校正：基于 `stylePolicy` 进行可读性增强（仅在对比度不足时启用）
+- 编辑/导出：Konva 画布渲染 + Remotion 导出 PNG/HTML
+
+#### 1. 目标与范围
+- **目标**：把自然语言脚本转换为“可执行布局指令”，并结合生图背景/元素，产出可编辑海报。
+- **范围**：独立于旧方案链路，新增 `generate-livecode` 页面与 `api/generate-livecode` 接口，不改动原方案。
+- **输出**：结构化 JSON（布局 + 视觉策略），进入现有 Konva 编辑器进行可视化与导出。
+
+#### 2. 端到端链路
+1. 前端提交：脚本 + 素材清单 + 画布尺寸 + 风格提示（可选）
+2. 后端调用结构理解 LLM：生成 `layoutCode + commands + background`
+3. 解析 JSON（严格校验 schema）
+4. 生图背景：使用 `background.prompt`
+5. 执行 `commands`：
+   - `text` 生成文字层
+   - `asset` / `generated` 生成图片层
+   - `rect` 生成可控的强调底图层
+6. 落盘为 `project.json` → 进入 Konva 编辑器
+
+#### 5. 可解析 JSON 设计（核心）
+LLM 必须返回一个可被后端解析并执行的 JSON，核心字段如下：
+```json
+{
+  "plan": "简短的技术方案/布局说明",
+  "layoutCode": "人类可读的布局伪代码（仅用于解释，不执行）",
+  "background": {
+    "prompt": "背景生图提示词（禁止文字）",
+    "negativePrompt": "可选"
+  },
+  "palette": { "background": "#0b0c10", "primary": "#ffffff", "secondary": "#b9c0cc", "accent": "#00f5d4" },
+  "fonts": { "title": "Noto Sans SC, ...", "body": "Noto Sans SC, ...", "display": "Noto Sans SC, ..." },
+  "stylePolicy": {
+    "contrast": { "minRatio": 4.0, "softRatio": 3.0 },
+    "roles": {
+      "title": { "enable": true, "shadowColor": "rgba(0,0,0,0.6)", "shadowBlur": 12, "shadowOffsetY": 6 },
+      "body": { "enable": true, "backdrop": { "enabled": true, "fillColor": "rgba(10,10,20,0.35)", "borderColor": "rgba(255,255,255,0.12)", "borderWidth": 1, "radius": 16, "padding": 12 } }
+    }
+  },
+  "commands": [
+    {
+      "op": "text",
+      "id": "title_1",
+      "role": "title|subtitle|body|list|highlight|note",
+      "text": "文本内容",
+      "box": { "x": 0.08, "y": 0.12, "w": 0.84, "h": 0.22 },
+      "style": {
+        "fontSize": 64,
+        "fontWeight": 800,
+        "color": "#FFFFFF",
+        "align": "left",
+        "lineHeight": 1.1,
+        "stroke": "rgba(0,0,0,0.5)",
+        "strokeWidth": 2,
+        "shadowColor": "rgba(0,0,0,0.6)",
+        "shadowBlur": 10,
+        "shadowOffsetX": 0,
+        "shadowOffsetY": 6,
+        "shadowOpacity": 0.6
+      }
+    },
+    {
+      "op": "rect",
+      "id": "backdrop_1",
+      "role": "body",
+      "box": { "x": 0.06, "y": 0.24, "w": 0.88, "h": 0.14 },
+      "style": {
+        "fillColor": "rgba(0,0,0,0.35)",
+        "borderColor": "rgba(255,255,255,0.08)",
+        "borderWidth": 1,
+        "radius": 16
+      }
+    },
+    {
+      "op": "asset",
+      "id": "asset_1",
+      "assetIndex": 0,
+      "box": { "x": 0.10, "y": 0.55, "w": 0.35, "h": 0.35 }
+    },
+    {
+      "op": "generated",
+      "id": "icon_1",
+      "label": "装饰图形",
+      "prompt": "与整体风格一致的装饰元素，单体，真实光影",
+      "box": { "x": 0.70, "y": 0.60, "w": 0.20, "h": 0.20 }
+    }
+  ]
+}
+```
+**解析原则**：
+- `box` 支持 **比例(0-1)** 或 **像素值**，后端统一归一化为像素。
+- `style` 内的视觉效果（阴影/描边/底图）**必须由模型显式给出**，后端不做默认强加。
+- `rect` 用于生成可控的文字底图或强调块，确保与背景配色协调。
+- `stylePolicy` 作为可读性兜底策略，仅在对比度不足时才会被执行。
+
+#### 6. 文字可读性与视觉策略
+- **不可默认套效果**：阴影/描边/底图只在必要时出现，由模型明确决定。
+- **配色一致性**：模型需给出与背景协调的 `shadowColor / stroke / fillColor`，避免“脏黑遮挡”。
+- **分层规则**：标题/重点可用高对比与轻量阴影，正文/列表优先用透明底图或轻描边。
+
+#### 7. 可执行性与容错
+- **Schema 校验**：返回 JSON 必须匹配 `commands` 结构，否则直接报错。
+- **LLM 调用日志**：记录 `status / model / duration / logid`，便于定位 429 与空返回。
+- **重试策略**：对空内容或解析失败会做有限重试，避免长 prompt 的偶发空 `content`。
 
 ## 生成流程（混合链路）
 

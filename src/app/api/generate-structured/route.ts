@@ -45,7 +45,24 @@ const LlmPlanSchema = z.object({
       fontWeight: z.number().optional(),
       color: z.string().optional(),
       align: z.enum(["left", "center", "right"]).optional(),
-      lineHeight: z.number().optional()
+      lineHeight: z.number().optional(),
+      stroke: z.string().optional(),
+      strokeWidth: z.number().optional(),
+      shadowColor: z.string().optional(),
+      shadowBlur: z.number().optional(),
+      shadowOffsetX: z.number().optional(),
+      shadowOffsetY: z.number().optional(),
+      shadowOpacity: z.number().optional(),
+      backdrop: z
+        .object({
+          enabled: z.boolean().optional(),
+          fillColor: z.string().optional(),
+          borderColor: z.string().optional(),
+          borderWidth: z.number().optional(),
+          radius: z.number().optional(),
+          padding: z.number().optional()
+        })
+        .optional()
     })
   ),
   palette: z
@@ -165,6 +182,82 @@ function formatListText(text: string) {
   return parts.map((item) => (item.startsWith("•") ? item : `• ${item}`)).join("\n");
 }
 
+function buildRectSvg({
+  width,
+  height,
+  fillColor,
+  borderColor,
+  borderWidth,
+  radius
+}: {
+  width: number;
+  height: number;
+  fillColor?: string;
+  borderColor?: string;
+  borderWidth?: number;
+  radius?: number;
+}) {
+  const w = Math.max(1, Math.round(width));
+  const h = Math.max(1, Math.round(height));
+  const rx = Math.max(0, Math.round(radius ?? 0));
+  const fill = fillColor?.trim() || "transparent";
+  const stroke = borderColor?.trim();
+  const strokeWidth = typeof borderWidth === "number" ? Math.max(0, borderWidth) : 0;
+  const rect = `<rect x="0" y="0" width="${w}" height="${h}" rx="${rx}" ry="${rx}" fill="${fill}"${
+    stroke && strokeWidth > 0 ? ` stroke="${stroke}" stroke-width="${strokeWidth}"` : ""
+  } />`;
+  const svg = `<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">${rect}</svg>`;
+  return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
+}
+
+function buildTextBackdropLayer({
+  box,
+  canvasWidth,
+  canvasHeight,
+  z,
+  fontSize,
+  style
+}: {
+  box: { x: number; y: number; w: number; h: number };
+  canvasWidth: number;
+  canvasHeight: number;
+  z: number;
+  fontSize: number;
+  style?: {
+    fillColor?: string;
+    borderColor?: string;
+    borderWidth?: number;
+    radius?: number;
+    padding?: number;
+  };
+}): PosterImageLayer {
+  const pad = Math.max(4, Math.round(style?.padding ?? Math.max(8, Math.round(fontSize * 0.25))));
+  const x = clamp(box.x - pad, 0, canvasWidth - 20);
+  const y = clamp(box.y - pad, 0, canvasHeight - 20);
+  const w = clamp(box.w + pad * 2, 20, canvasWidth);
+  const h = clamp(box.h + pad * 2, 20, canvasHeight);
+  const src = buildRectSvg({
+    width: w,
+    height: h,
+    fillColor: style?.fillColor ?? "rgba(0,0,0,0.35)",
+    borderColor: style?.borderColor ?? "rgba(255,255,255,0.08)",
+    borderWidth: style?.borderWidth ?? 1,
+    radius: Math.round(style?.radius ?? Math.max(10, Math.round(fontSize * 0.35)))
+  });
+  return {
+    id: `layer_backdrop_${nanoid()}`,
+    type: "image",
+    x,
+    y,
+    w,
+    h,
+    rotation: 0,
+    z,
+    src,
+    role: "text_backdrop",
+    locked: true
+  };
+}
 function safeParseJson(raw: string) {
   const trimmed = raw.trim();
   try {
@@ -260,7 +353,10 @@ async function callStructureLlm({
     "3) 不要输出 markdown，不要解释文字。",
     "4) textBlocks 至少包含标题。",
     "5) elements 只放需要出现在画面的素材或需生图的特殊元素。",
-    "6) 如果你的系统会分离 reasoning，请确保最终 JSON 出现在最终回答的 content 中。",
+    "6) 阴影/描边/底图(backdrop)只在确实需要提升可读性时才使用，不要默认给所有文字加效果。",
+    "7) 阴影/描边/底图的颜色必须与背景整体配色协调，避免脏黑遮挡；需要你完整定义颜色与透明度。",
+    "8) 如果需要底图，请在 textBlocks[n].backdrop 中定义（enabled=true + fillColor/borderColor 等）。",
+    "9) 如果你的系统会分离 reasoning，请确保最终 JSON 出现在最终回答的 content 中。",
     "",
     `画布尺寸：${width}x${height}`,
     styleHint?.trim() ? `风格提示：${styleHint.trim()}` : "风格提示：延续当前产品的简洁科技感与高对比海报风格。",
@@ -394,7 +490,8 @@ export async function POST(req: Request) {
     const palette = plan.palette ?? {};
     const fonts = { ...DEFAULT_FONTS, ...(plan.fonts ?? {}) };
 
-    const textLayers: PosterTextLayer[] = plan.textBlocks.map((block, index) => {
+  const imageLayers: PosterImageLayer[] = [];
+  const textLayers: PosterTextLayer[] = plan.textBlocks.map((block, index) => {
     const box = normalizeBox(block, width, height);
     const role = block.role;
     const fontFamily =
@@ -433,7 +530,7 @@ export async function POST(req: Request) {
       autoGrow: true
     });
 
-    return {
+    const textLayer: PosterTextLayer = {
       id: `layer_${block.id}`,
       type: "text",
       x: fitted.x,
@@ -448,13 +545,40 @@ export async function POST(req: Request) {
       fontWeight,
       color,
       align: fitted.align,
-      lineHeight: fitted.lineHeight
+      lineHeight: fitted.lineHeight,
+      stroke: block.stroke,
+      strokeWidth: block.strokeWidth,
+      shadowColor: block.shadowColor,
+      shadowBlur: block.shadowBlur,
+      shadowOffsetX: block.shadowOffsetX,
+      shadowOffsetY: block.shadowOffsetY,
+      shadowOpacity: block.shadowOpacity
     };
+
+    if (block.backdrop?.enabled) {
+      imageLayers.push(
+        buildTextBackdropLayer({
+          box: { x: textLayer.x, y: textLayer.y, w: textLayer.w, h: textLayer.h },
+          canvasWidth: width,
+          canvasHeight: height,
+          z: textLayer.z - 1,
+          fontSize: textLayer.fontSize,
+          style: {
+            fillColor: block.backdrop.fillColor,
+            borderColor: block.backdrop.borderColor,
+            borderWidth: block.backdrop.borderWidth,
+            radius: block.backdrop.radius,
+            padding: block.backdrop.padding
+          }
+        })
+      );
+    }
+
+    return textLayer;
   });
 
-    const imageLayers: PosterImageLayer[] = [];
-    const elements = plan.elements ?? [];
-    const MAX_ELEMENTS = 4;
+  const elements = plan.elements ?? [];
+  const MAX_ELEMENTS = 4;
 
     for (const [index, element] of elements.entries()) {
       if (index >= MAX_ELEMENTS) break;
@@ -507,7 +631,7 @@ export async function POST(req: Request) {
     }
 
     const id = `proj_${nanoid()}`;
-    const project: PosterProject = {
+  const project: PosterProject = {
       id,
       createdAt: new Date().toISOString(),
       inputText: [
@@ -535,8 +659,8 @@ export async function POST(req: Request) {
           backgroundUrl
         }
       },
-      layers: [...imageLayers, ...textLayers]
-    };
+    layers: [...imageLayers, ...textLayers]
+  };
 
     await writeJson(dataDir("projects", `${id}.json`), project);
 

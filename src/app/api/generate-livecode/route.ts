@@ -50,7 +50,24 @@ const CommandSchema = z.discriminatedUnion("op", [
         fontWeight: z.number().optional(),
         color: z.string().optional(),
         align: z.enum(["left", "center", "right"]).optional(),
-        lineHeight: z.number().optional()
+        lineHeight: z.number().optional(),
+        stroke: z.string().optional(),
+        strokeWidth: z.number().optional(),
+        shadowColor: z.string().optional(),
+        shadowBlur: z.number().optional(),
+        shadowOffsetX: z.number().optional(),
+        shadowOffsetY: z.number().optional(),
+        shadowOpacity: z.number().optional()
+      })
+      .optional(),
+    backdrop: z
+      .object({
+        enabled: z.boolean().optional(),
+        fillColor: z.string().optional(),
+        borderColor: z.string().optional(),
+        borderWidth: z.number().optional(),
+        radius: z.number().optional(),
+        padding: z.number().optional()
       })
       .optional()
   }),
@@ -103,6 +120,40 @@ const LlmLayoutSchema = z.object({
       title: z.string().optional(),
       body: z.string().optional(),
       display: z.string().optional()
+    })
+    .optional(),
+  stylePolicy: z
+    .object({
+      contrast: z
+        .object({
+          minRatio: z.number().optional(),
+          softRatio: z.number().optional()
+        })
+        .optional(),
+      roles: z
+        .record(
+          z.object({
+            enable: z.boolean().optional(),
+            stroke: z.string().optional(),
+            strokeWidth: z.number().optional(),
+            shadowColor: z.string().optional(),
+            shadowBlur: z.number().optional(),
+            shadowOffsetX: z.number().optional(),
+            shadowOffsetY: z.number().optional(),
+            shadowOpacity: z.number().optional(),
+            backdrop: z
+              .object({
+                enabled: z.boolean().optional(),
+                fillColor: z.string().optional(),
+                borderColor: z.string().optional(),
+                borderWidth: z.number().optional(),
+                radius: z.number().optional(),
+                padding: z.number().optional()
+              })
+              .optional()
+          })
+        )
+        .optional()
     })
     .optional(),
   commands: z.array(CommandSchema).min(1)
@@ -251,6 +302,106 @@ function buildRectSvg({
   return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
 }
 
+function buildTextBackdropLayer({
+  box,
+  canvasWidth,
+  canvasHeight,
+  z,
+  fontSize,
+  style
+}: {
+  box: { x: number; y: number; w: number; h: number };
+  canvasWidth: number;
+  canvasHeight: number;
+  z: number;
+  fontSize: number;
+  style?: {
+    fillColor?: string;
+    borderColor?: string;
+    borderWidth?: number;
+    radius?: number;
+    padding?: number;
+  };
+}): PosterImageLayer {
+  const pad = Math.max(4, Math.round(style?.padding ?? Math.max(8, Math.round(fontSize * 0.25))));
+  const x = clamp(box.x - pad, 0, canvasWidth - 20);
+  const y = clamp(box.y - pad, 0, canvasHeight - 20);
+  const w = clamp(box.w + pad * 2, 20, canvasWidth);
+  const h = clamp(box.h + pad * 2, 20, canvasHeight);
+  const src = buildRectSvg({
+    width: w,
+    height: h,
+    fillColor: style?.fillColor ?? "rgba(0,0,0,0.35)",
+    borderColor: style?.borderColor ?? "rgba(255,255,255,0.08)",
+    borderWidth: style?.borderWidth ?? 1,
+    radius: Math.round(style?.radius ?? Math.max(10, Math.round(fontSize * 0.35)))
+  });
+  return {
+    id: `layer_backdrop_${nanoid()}`,
+    type: "image",
+    x,
+    y,
+    w,
+    h,
+    rotation: 0,
+    z,
+    src,
+    role: "text_backdrop",
+    locked: true
+  };
+}
+
+function parseColor(input?: string) {
+  if (!input) return null;
+  const value = input.trim();
+  const hexMatch = value.match(/^#([0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i);
+  if (hexMatch) {
+    const hex = hexMatch[1];
+    if (hex.length === 3) {
+      const r = parseInt(hex[0] + hex[0], 16);
+      const g = parseInt(hex[1] + hex[1], 16);
+      const b = parseInt(hex[2] + hex[2], 16);
+      return { r, g, b, a: 1 };
+    }
+    if (hex.length === 6 || hex.length === 8) {
+      const r = parseInt(hex.slice(0, 2), 16);
+      const g = parseInt(hex.slice(2, 4), 16);
+      const b = parseInt(hex.slice(4, 6), 16);
+      const a = hex.length === 8 ? parseInt(hex.slice(6, 8), 16) / 255 : 1;
+      return { r, g, b, a };
+    }
+  }
+  const rgbMatch = value.match(/^rgba?\\(([^)]+)\\)$/i);
+  if (rgbMatch) {
+    const parts = rgbMatch[1].split(",").map((v) => v.trim());
+    const r = Number(parts[0]);
+    const g = Number(parts[1]);
+    const b = Number(parts[2]);
+    const a = parts.length > 3 ? Number(parts[3]) : 1;
+    if ([r, g, b, a].every((n) => Number.isFinite(n))) return { r, g, b, a };
+  }
+  return null;
+}
+
+function relativeLuminance({ r, g, b }: { r: number; g: number; b: number }) {
+  const toLinear = (c: number) => {
+    const v = c / 255;
+    return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+  };
+  const R = toLinear(r);
+  const G = toLinear(g);
+  const B = toLinear(b);
+  return 0.2126 * R + 0.7152 * G + 0.0722 * B;
+}
+
+function contrastRatio(a: { r: number; g: number; b: number }, b: { r: number; g: number; b: number }) {
+  const L1 = relativeLuminance(a);
+  const L2 = relativeLuminance(b);
+  const lighter = Math.max(L1, L2);
+  const darker = Math.min(L1, L2);
+  return (lighter + 0.05) / (darker + 0.05);
+}
+
 async function writeBase64Image({
   base64,
   mimeType,
@@ -315,6 +466,13 @@ async function callLiveCodeLlm({
   "background": { "prompt": "背景生图提示词（禁止出现任何文字）", "negativePrompt": "可选" },
   "palette": { "background": "#0b0c10", "primary": "#ffffff", "secondary": "#b9c0cc", "accent": "#00f5d4" },
   "fonts": { "title": "Noto Sans SC, ...", "body": "Noto Sans SC, ...", "display": "Noto Sans SC, ..." },
+  "stylePolicy": {
+    "contrast": { "minRatio": 4.0, "softRatio": 3.0 },
+    "roles": {
+      "title": { "enable": true, "shadowColor": "rgba(0,0,0,0.6)", "shadowBlur": 12, "shadowOffsetY": 6 },
+      "body": { "enable": true, "backdrop": { "enabled": true, "fillColor": "rgba(10,10,20,0.35)", "borderColor": "rgba(255,255,255,0.12)", "borderWidth": 1, "radius": 16, "padding": 12 } }
+    }
+  },
   "commands": [
     {
       "op": "text",
@@ -322,10 +480,12 @@ async function callLiveCodeLlm({
       "role": "title|subtitle|body|list|highlight|note",
       "text": "文本内容",
       "box": { "x": 0.08, "y": 0.12, "w": 0.84, "h": 0.22 },
-      "style": { "fontSize": 64, "fontWeight": 800, "color": "#FFFFFF", "align": "left", "lineHeight": 1.1 }
+      "style": { "fontSize": 64, "fontWeight": 800, "color": "#FFFFFF", "align": "left", "lineHeight": 1.1, "stroke": "rgba(0,0,0,0.45)", "strokeWidth": 2, "shadowColor": "rgba(0,0,0,0.6)", "shadowBlur": 12, "shadowOffsetY": 6, "shadowOpacity": 0.6 },
+      "backdrop": { "enabled": false }
     },
     { "op": "asset", "id": "asset_1", "assetIndex": 0, "box": { "x": 0.1, "y": 0.55, "w": 0.35, "h": 0.35 } },
-    { "op": "generated", "id": "icon_1", "label": "装饰图形", "prompt": "与整体风格一致的装饰元素，单体，真实光影", "box": { "x": 0.7, "y": 0.6, "w": 0.2, "h": 0.2 } }
+    { "op": "generated", "id": "icon_1", "label": "装饰图形", "prompt": "与整体风格一致的装饰元素，单体，真实光影", "box": { "x": 0.7, "y": 0.6, "w": 0.2, "h": 0.2 } },
+    { "op": "rect", "id": "backdrop_1", "role": "body", "box": { "x": 0.06, "y": 0.24, "w": 0.88, "h": 0.14 }, "style": { "fillColor": "rgba(10,10,20,0.35)", "borderColor": "rgba(255,255,255,0.12)", "borderWidth": 1, "radius": 16 } }
   ]
 }`;
 
@@ -344,8 +504,12 @@ async function callLiveCodeLlm({
     "2) commands 的 box 坐标用 0-1 相对比例（或像素），但建议用 0-1。",
     "3) 背景 background.prompt 必须符合视觉风格，且严格禁止出现任何文字/字母/数字/logo/水印。",
     "4) 重点(highlight)要更醒目（字号/色彩/留白），列表(list)要有 bullet。",
-    "5) 如果 assets 中某条没有 URL，但必须出现在画面里，可以用 generated 命令生成元素。",
-    "6) 如果你的系统会分离 reasoning，请确保最终 JSON 出现在最终回答的 content 中。",
+    "5) 只有在确实需要增强可读性时才使用阴影/描边/底图，不要默认给所有文字加效果。",
+    "6) 阴影/描边/底图的颜色必须与背景整体配色协调（例如：深色背景用冷色半透明底图，亮色背景用更浅底图），避免脏黑遮挡。",
+    "7) 如果需要底图，请优先用 text.backdrop 或 rect（并定义 fill/border/opacity），不得留空。",
+    "8) 请返回 stylePolicy（至少包含 contrast.minRatio 和常用 role 策略）。",
+    "9) 如果 assets 中某条没有 URL，但必须出现在画面里，可以用 generated 命令生成元素。",
+    "10) 如果你的系统会分离 reasoning，请确保最终 JSON 出现在最终回答的 content 中。",
     "",
     `画布尺寸：${width}x${height}`,
     `设计风格约束：${buildDesignStyleHint(styleHint)}`,
@@ -362,7 +526,7 @@ async function callLiveCodeLlm({
   const body = {
     stream: false,
     model,
-    max_tokens: 2000,
+    max_tokens: 4000,
     messages: [
       {
         role: "user",
@@ -459,194 +623,249 @@ export async function POST(req: Request) {
     });
     const backgroundUrl = backgroundFile.url;
 
-  const palette = llm.palette ?? {};
-  const fonts = { ...DEFAULT_FONTS, ...(llm.fonts ?? {}) };
+    const palette = llm.palette ?? {};
+    const fonts = { ...DEFAULT_FONTS, ...(llm.fonts ?? {}) };
+    const stylePolicy = llm.stylePolicy ?? {};
+    const backgroundColor =
+      parseColor(palette.background) ?? parseColor("#0b0c10") ?? { r: 11, g: 12, b: 16, a: 1 };
+    const minRatio = stylePolicy.contrast?.minRatio ?? 4;
+    const softRatio = stylePolicy.contrast?.softRatio ?? Math.max(3, minRatio - 1);
 
-  const imageLayers: PosterImageLayer[] = [];
-  const textLayers: PosterTextLayer[] = [];
+    const imageLayers: PosterImageLayer[] = [];
+    const textLayers: PosterTextLayer[] = [];
 
-  const MAX_ELEMENTS = 6;
-  let elementCount = 0;
+    const MAX_ELEMENTS = 6;
+    let elementCount = 0;
 
-  for (const [index, cmd] of llm.commands.entries()) {
-    if (cmd.op === "text") {
-      const box = normalizeBox(cmd.box, width, height);
-      const role = cmd.role;
-      const fontFamily = role === "title" ? fonts.title : role === "highlight" ? fonts.display : fonts.body;
-      const baseFontSize = resolveFontSize(
-        cmd.style?.fontSize,
-        width,
-        role === "title"
-          ? Math.round(height * 0.07)
+    for (const [index, cmd] of llm.commands.entries()) {
+      if (cmd.op === "text") {
+        const box = normalizeBox(cmd.box, width, height);
+        const role = cmd.role;
+        const fontFamily = role === "title" ? fonts.title : role === "highlight" ? fonts.display : fonts.body;
+        const baseFontSize = resolveFontSize(
+          cmd.style?.fontSize,
+          width,
+          role === "title"
+            ? Math.round(height * 0.07)
+            : role === "highlight"
+              ? Math.round(height * 0.05)
+              : role === "subtitle"
+                ? Math.round(height * 0.04)
+                : Math.round(height * 0.033)
+        );
+        const fontWeight = cmd.style?.fontWeight ?? (role === "title" || role === "highlight" ? 800 : 500);
+        const color = isHexColor(cmd.style?.color)
+          ? (cmd.style?.color as string)
           : role === "highlight"
-            ? Math.round(height * 0.05)
-            : role === "subtitle"
-              ? Math.round(height * 0.04)
-              : Math.round(height * 0.033)
-      );
-      const fontWeight = cmd.style?.fontWeight ?? (role === "title" || role === "highlight" ? 800 : 500);
-      const color = isHexColor(cmd.style?.color)
-        ? (cmd.style?.color as string)
-        : role === "highlight"
-          ? isHexColor(palette.accent)
-            ? (palette.accent as string)
-            : "#00f5d4"
-          : isHexColor(palette.primary)
-            ? (palette.primary as string)
-            : "#ffffff";
-      const align = cmd.style?.align ?? (role === "title" ? "left" : "left");
-      const lineHeight =
-        typeof cmd.style?.lineHeight === "number" && cmd.style.lineHeight > 0.8 && cmd.style.lineHeight < 3
-          ? cmd.style.lineHeight
-          : TEXT_LINE_HEIGHT;
-      const text = role === "list" ? formatListText(cmd.text) : cmd.text;
+            ? isHexColor(palette.accent)
+              ? (palette.accent as string)
+              : "#00f5d4"
+            : isHexColor(palette.primary)
+              ? (palette.primary as string)
+              : "#ffffff";
+        const align = cmd.style?.align ?? (role === "title" ? "left" : "left");
+        const lineHeight =
+          typeof cmd.style?.lineHeight === "number" && cmd.style.lineHeight > 0.8 && cmd.style.lineHeight < 3
+            ? cmd.style.lineHeight
+            : TEXT_LINE_HEIGHT;
+        const text = role === "list" ? formatListText(cmd.text) : cmd.text;
 
-      const fitted = fitTextInBox({
-        text,
-        box,
-        align,
-        fontSize: baseFontSize,
-        minFontSize: Math.max(12, Math.round(baseFontSize * 0.6)),
-        maxFontSize: Math.round(baseFontSize * 1.1),
-        lineHeight,
-        verticalAlign: role === "title" ? "top" : "center",
-        autoGrow: true
-      });
+        const fitted = fitTextInBox({
+          text,
+          box,
+          align,
+          fontSize: baseFontSize,
+          minFontSize: Math.max(12, Math.round(baseFontSize * 0.6)),
+          maxFontSize: Math.round(baseFontSize * 1.1),
+          lineHeight,
+          verticalAlign: role === "title" ? "top" : "center",
+          autoGrow: true
+        });
 
-      textLayers.push({
-        id: `layer_${cmd.id}`,
-        type: "text",
-        x: fitted.x,
-        y: fitted.y,
-        w: fitted.w,
-        h: fitted.h,
-        rotation: 0,
-        z: 200 + index,
-        text: fitted.text,
-        fontFamily,
-        fontSize: fitted.fontSize,
-        fontWeight,
-        color,
-        align: fitted.align,
-        lineHeight: fitted.lineHeight
-      });
-      continue;
-    }
+        const rolePolicy = stylePolicy.roles?.[role];
+        const textColorParsed = parseColor(color);
+        const contrast =
+          backgroundColor && textColorParsed ? contrastRatio(backgroundColor, textColorParsed) : minRatio + 1;
+        const needsEnhance = contrast < minRatio;
+        const softEnhance = contrast < softRatio;
+        const shouldEnhance = (needsEnhance || softEnhance) && rolePolicy?.enable;
 
-    if (elementCount >= MAX_ELEMENTS) continue;
-    elementCount += 1;
+        const stroke = cmd.style?.stroke ?? (shouldEnhance ? rolePolicy?.stroke : undefined);
+        const strokeWidth = cmd.style?.strokeWidth ?? (shouldEnhance ? rolePolicy?.strokeWidth : undefined);
+        const shadowColor = cmd.style?.shadowColor ?? (shouldEnhance ? rolePolicy?.shadowColor : undefined);
+        const shadowBlur = cmd.style?.shadowBlur ?? (shouldEnhance ? rolePolicy?.shadowBlur : undefined);
+        const shadowOffsetX = cmd.style?.shadowOffsetX ?? (shouldEnhance ? rolePolicy?.shadowOffsetX : undefined);
+        const shadowOffsetY = cmd.style?.shadowOffsetY ?? (shouldEnhance ? rolePolicy?.shadowOffsetY : undefined);
+        const shadowOpacity = cmd.style?.shadowOpacity ?? (shouldEnhance ? rolePolicy?.shadowOpacity : undefined);
 
-    if (cmd.op === "asset") {
-      const asset = assets[cmd.assetIndex];
-      if (!asset?.url) continue;
-      const box = normalizeBox(cmd.box, width, height);
-      const downloaded = await downloadAsset(asset.url);
-      const saved = await writeBase64Image({
-        base64: downloaded.base64,
-        mimeType: downloaded.mimeType,
-        prefix: "asset"
-      });
-      imageLayers.push({
-        id: `layer_${cmd.id}`,
-        type: "image",
-        x: box.x,
-        y: box.y,
-        w: box.w,
-        h: box.h,
-        rotation: 0,
-        z: 120 + index,
-        src: saved.url,
-        role: "asset"
-      });
-      continue;
-    }
+        const backdropStyle = cmd.backdrop?.enabled
+          ? cmd.backdrop
+          : shouldEnhance && rolePolicy?.backdrop?.enabled
+            ? rolePolicy.backdrop
+            : undefined;
+        if (backdropStyle?.enabled) {
+          imageLayers.push(
+            buildTextBackdropLayer({
+              box: fitted,
+              canvasWidth: width,
+              canvasHeight: height,
+              z: 190 + index,
+              fontSize: fitted.fontSize,
+              style: {
+                fillColor: backdropStyle.fillColor,
+                borderColor: backdropStyle.borderColor,
+                borderWidth: backdropStyle.borderWidth,
+                radius: backdropStyle.radius,
+                padding: backdropStyle.padding
+              }
+            })
+          );
+        }
 
-    if (cmd.op === "generated") {
-      const box = normalizeBox(cmd.box, width, height);
-      const generated = await nanoBanana3pGenerateImage({
-        text: cmd.prompt,
-        aspectRatio: `${Math.max(1, Math.round(box.w))}:${Math.max(1, Math.round(box.h))}`,
-        imageSize: "1K",
-        seedTag: `el_${nanoid()}`,
-        includeNegative: true
-      });
-      const saved = await writeBase64Image({
-        base64: generated.base64,
-        mimeType: generated.mimeType,
-        prefix: "element"
-      });
-      imageLayers.push({
-        id: `layer_${cmd.id}`,
-        type: "image",
-        x: box.x,
-        y: box.y,
-        w: box.w,
-        h: box.h,
-        rotation: 0,
-        z: 120 + index,
-        src: saved.url,
-        role: "asset"
-      });
-      continue;
-    }
-
-    if (cmd.op === "rect") {
-      const box = normalizeBox(cmd.box, width, height);
-      const src = buildRectSvg({
-        width: box.w,
-        height: box.h,
-        fillColor: cmd.style?.fillColor,
-        borderColor: cmd.style?.borderColor,
-        borderWidth: cmd.style?.borderWidth,
-        radius: cmd.style?.radius
-      });
-      imageLayers.push({
-        id: `layer_${cmd.id}`,
-        type: "image",
-        x: box.x,
-        y: box.y,
-        w: box.w,
-        h: box.h,
-        rotation: 0,
-        z: 110 + index,
-        src,
-        role: "asset"
-      });
-      continue;
-    }
-  }
-
-  const id = `proj_${nanoid()}`;
-  const project: PosterProject = {
-    id,
-    createdAt: new Date().toISOString(),
-    inputText: [
-      "脚本:",
-      body.script,
-      "",
-      "素材:",
-      assets.length ? assets.map((item, i) => `#${i} ${item.label}${item.url ? ` (${item.url})` : ""}`).join("\n") : "无"
-    ].join("\n"),
-    canvas: {
-      width,
-      height,
-      background: { url: backgroundUrl }
-    },
-    meta: {
-      provider: "gpt-5.1-2025-11-13",
-      prompt: llm.background.prompt,
-      negativePrompt: llm.background.negativePrompt,
-      params: {
-        plan: llm.plan,
-        layoutCode: llm.layoutCode,
-        commands: llm.commands,
-        palette: llm.palette,
-        fonts: llm.fonts,
-        backgroundUrl
+        textLayers.push({
+          id: `layer_${cmd.id}`,
+          type: "text",
+          x: fitted.x,
+          y: fitted.y,
+          w: fitted.w,
+          h: fitted.h,
+          rotation: 0,
+          z: 200 + index,
+          text: fitted.text,
+          fontFamily,
+          fontSize: fitted.fontSize,
+          fontWeight,
+          color,
+          align: fitted.align,
+          lineHeight: fitted.lineHeight,
+          stroke,
+          strokeWidth,
+          shadowColor,
+          shadowBlur,
+          shadowOffsetX,
+          shadowOffsetY,
+          shadowOpacity
+        });
+        continue;
       }
-    },
-    layers: [...imageLayers, ...textLayers]
-  };
+
+      if (elementCount >= MAX_ELEMENTS) continue;
+      elementCount += 1;
+
+      if (cmd.op === "asset") {
+        const asset = assets[cmd.assetIndex];
+        if (!asset?.url) continue;
+        const box = normalizeBox(cmd.box, width, height);
+        const downloaded = await downloadAsset(asset.url);
+        const saved = await writeBase64Image({
+          base64: downloaded.base64,
+          mimeType: downloaded.mimeType,
+          prefix: "asset"
+        });
+        imageLayers.push({
+          id: `layer_${cmd.id}`,
+          type: "image",
+          x: box.x,
+          y: box.y,
+          w: box.w,
+          h: box.h,
+          rotation: 0,
+          z: 120 + index,
+          src: saved.url,
+          role: "asset"
+        });
+        continue;
+      }
+
+      if (cmd.op === "generated") {
+        const box = normalizeBox(cmd.box, width, height);
+        const generated = await nanoBanana3pGenerateImage({
+          text: cmd.prompt,
+          aspectRatio: `${Math.max(1, Math.round(box.w))}:${Math.max(1, Math.round(box.h))}`,
+          imageSize: "1K",
+          seedTag: `el_${nanoid()}`,
+          includeNegative: true
+        });
+        const saved = await writeBase64Image({
+          base64: generated.base64,
+          mimeType: generated.mimeType,
+          prefix: "element"
+        });
+        imageLayers.push({
+          id: `layer_${cmd.id}`,
+          type: "image",
+          x: box.x,
+          y: box.y,
+          w: box.w,
+          h: box.h,
+          rotation: 0,
+          z: 120 + index,
+          src: saved.url,
+          role: "asset"
+        });
+        continue;
+      }
+
+      if (cmd.op === "rect") {
+        const box = normalizeBox(cmd.box, width, height);
+        const src = buildRectSvg({
+          width: box.w,
+          height: box.h,
+          fillColor: cmd.style?.fillColor,
+          borderColor: cmd.style?.borderColor,
+          borderWidth: cmd.style?.borderWidth,
+          radius: cmd.style?.radius
+        });
+        imageLayers.push({
+          id: `layer_${cmd.id}`,
+          type: "image",
+          x: box.x,
+          y: box.y,
+          w: box.w,
+          h: box.h,
+          rotation: 0,
+          z: 110 + index,
+          src,
+          role: "asset"
+        });
+        continue;
+      }
+    }
+
+    const id = `proj_${nanoid()}`;
+    const project: PosterProject = {
+      id,
+      createdAt: new Date().toISOString(),
+      inputText: [
+        "脚本:",
+        body.script,
+        "",
+        "素材:",
+        assets.length
+          ? assets.map((item, i) => `#${i} ${item.label}${item.url ? ` (${item.url})` : ""}`).join("\n")
+          : "无"
+      ].join("\n"),
+      canvas: {
+        width,
+        height,
+        background: { url: backgroundUrl }
+      },
+      meta: {
+        provider: "gpt-5.1-2025-11-13",
+        prompt: llm.background.prompt,
+        negativePrompt: llm.background.negativePrompt,
+        params: {
+          plan: llm.plan,
+          layoutCode: llm.layoutCode,
+          commands: llm.commands,
+          palette: llm.palette,
+          fonts: llm.fonts,
+          stylePolicy: llm.stylePolicy,
+          backgroundUrl
+        }
+      },
+      layers: [...imageLayers, ...textLayers]
+    };
 
     await writeJson(dataDir("projects", `${id}.json`), project);
 

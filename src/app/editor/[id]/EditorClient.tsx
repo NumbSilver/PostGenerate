@@ -42,6 +42,13 @@ type TextLayer = BaseLayer & {
   color: string;
   align: "left" | "center" | "right";
   lineHeight?: number;
+  stroke?: string;
+  strokeWidth?: number;
+  shadowColor?: string;
+  shadowBlur?: number;
+  shadowOffsetX?: number;
+  shadowOffsetY?: number;
+  shadowOpacity?: number;
 };
 
 type ImageLayer = BaseLayer & {
@@ -50,7 +57,7 @@ type ImageLayer = BaseLayer & {
   opacity?: number;
   visible?: boolean;
   locked?: boolean;
-  role?: "asset" | "guide_b_overlay";
+  role?: "asset" | "guide_b_overlay" | "text_backdrop";
 };
 
 function clamp(n: number, min: number, max: number) {
@@ -412,6 +419,13 @@ export default function EditorClient({ projectId }: { projectId: string }) {
                           fontStyle={layer.fontWeight >= 700 ? "bold" : "normal"}
                           align={layer.align}
                           lineHeight={layer.lineHeight ?? 1.2}
+                          stroke={layer.stroke}
+                          strokeWidth={layer.strokeWidth}
+                          shadowColor={layer.shadowColor}
+                          shadowBlur={layer.shadowBlur}
+                          shadowOffsetX={layer.shadowOffsetX}
+                          shadowOffsetY={layer.shadowOffsetY}
+                          shadowOpacity={layer.shadowOpacity}
                           draggable
                           onClick={() => setSelectedId(layer.id)}
                           onTap={() => setSelectedId(layer.id)}

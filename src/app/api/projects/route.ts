@@ -37,7 +37,14 @@ const BodySchema = z.object({
           fontWeight: z.number(),
           color: z.string(),
           align: z.union([z.literal("left"), z.literal("center"), z.literal("right")]),
-          lineHeight: z.number().min(0.8).max(3).optional()
+          lineHeight: z.number().min(0.8).max(3).optional(),
+          stroke: z.string().optional(),
+          strokeWidth: z.number().optional(),
+          shadowColor: z.string().optional(),
+          shadowBlur: z.number().optional(),
+          shadowOffsetX: z.number().optional(),
+          shadowOffsetY: z.number().optional(),
+          shadowOpacity: z.number().optional()
         }),
         z.object({
           type: z.literal("image"),
@@ -52,7 +59,7 @@ const BodySchema = z.object({
           opacity: z.number().min(0).max(1).optional(),
           visible: z.boolean().optional(),
           locked: z.boolean().optional(),
-          role: z.union([z.literal("asset"), z.literal("guide_b_overlay")]).optional()
+          role: z.union([z.literal("asset"), z.literal("guide_b_overlay"), z.literal("text_backdrop")]).optional()
         })
       ])
     )
